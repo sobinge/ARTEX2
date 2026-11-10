@@ -153,23 +153,33 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 // filter on that column". Sort is "severity" (severity desc, then time) or
 // anything else (time only). TimeDirection defaults to newest first.
 type FindingFilter struct {
-	Severity      string // high | medium | low
-	Status        string // pending | false_positive | ignored | resolved
-	VulnClass     string
-	TaskID        string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
-	Query         string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
-	Sort          string // "severity" | "time"
-	TimeDirection string // "asc" | "desc"; applies to time, not the severity ranking
-	From          string // RFC3339 timestamp, inclusive
-	To            string // RFC3339 timestamp, inclusive
-	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
+	Severity  string // high | medium | low
+	Status    string // pending | false_positive | ignored | resolved
+	VulnClass string
+	// VulnClassGroup 是归一化后的父类型（如 BOLA/IDOR）。设置后按该组包含的
+	// 全部原始 vulnclass 过滤；findings.vulnclass 的原始文本保持不变。
+	VulnClassGroup string
+	TaskID         string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
+	Query          string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
+	Sort           string // "severity" | "time"
+	TimeDirection  string // "asc" | "desc"; applies to time, not the severity ranking
+	From           string // RFC3339 timestamp, inclusive
+	To             string // RFC3339 timestamp, inclusive
+	// AssetScope 是资产树单个节点的 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
-	AssetScope string
+	// AssetScopes 是多选时的节点列表；两者都空时不过滤。
+	AssetScope  string
+	AssetScopes []string
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
 	assetIDs  []int64 // 子树里所有资产 id
 	assetNone bool    // 只要「未关联资产」的发现
 	assetMiss bool    // 选中的节点在当前筛选下不存在 → 结果恒空
+
+	// vulnClasses/vulnClassMiss 由 applyVulnClassGroup 从 VulnClassGroup 解析而来;
+	// 调用方只传 VulnClassGroup,不用设置这两个字段。
+	vulnClasses   []string
+	vulnClassMiss bool
 }
 
 // timeOrder only returns SQL keywords from a fixed allowlist.
@@ -184,6 +194,17 @@ func (f FindingFilter) timeOrder() string {
 // absent. That includes rows created without a task and rows retained after their
 // originating task was deleted (the findings FK is ON DELETE SET NULL).
 const FindingUnassignedTask = "__unassigned__"
+
+// findingUnassignedAssetCond 是「未关联资产」的 SQL 条件：asset_ids 为空，或
+// 里面的 id 一个都不在 assets 表里（资产已被删除）。资产树底部的未关联桶与
+// 列表筛选必须用同一口径，否则桶上的计数会大于点开后能查到的条数。
+const findingUnassignedAssetCond = `(
+	jsonb_array_length(COALESCE(f.asset_ids, '[]'::jsonb)) = 0
+	OR NOT EXISTS (
+		SELECT 1 FROM jsonb_array_elements_text(f.asset_ids) e(v)
+		JOIN assets a ON a.id = e.v::bigint
+	)
+)`
 
 // where builds the WHERE clause (shared by the page and count queries) plus its
 // positional args. All values are parameterized; Query also escapes ILIKE
@@ -201,6 +222,15 @@ func (f FindingFilter) where() (string, []any) {
 	add("severity", f.Severity)
 	add("status", f.Status)
 	add("vulnclass", f.VulnClass)
+	// 父类型筛选：把归一化后的组展开成全部原始 vulnclass（text[]），与列表/导出/
+	// 资产树共用同一条件。组在当前数据下不存在时结果恒空，而不是退化成不过滤。
+	switch {
+	case f.vulnClassMiss:
+		conds = append(conds, "FALSE")
+	case len(f.vulnClasses) > 0:
+		args = append(args, f.vulnClasses)
+		conds = append(conds, fmt.Sprintf("f.vulnclass = ANY($%d::text[])", len(args)))
+	}
 	if from := strings.TrimSpace(f.From); from != "" {
 		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
 			args = append(args, parsed)
@@ -221,20 +251,15 @@ func (f FindingFilter) where() (string, []any) {
 		conds = append(conds, fmt.Sprintf("f.task_id = $%d", len(args)))
 	}
 	// 资产筛选:asset_ids 是 jsonb 数组,@> ANY(...) 能走 idx_findings_asset_ids。
+	// 多选时资产 id 取并集；若同时选了「未关联资产」，则 OR 上图未关联条件。
 	switch {
 	case f.assetMiss:
 		conds = append(conds, "FALSE")
+	case f.assetNone && len(f.assetIDs) > 0:
+		args = append(args, assetIDContainments(f.assetIDs))
+		conds = append(conds, fmt.Sprintf("(f.asset_ids @> ANY($%d::jsonb[]) OR %s)", len(args), findingUnassignedAssetCond))
 	case f.assetNone:
-		// 「未关联资产」= asset_ids 为空,或者里面的 id 一个都不在 assets 表里
-		// (资产已被删除)。两类都进资产树的未关联桶,这里必须同样收下,否则桶上
-		// 的计数会大于点开后能查到的条数。
-		conds = append(conds, `(
-			jsonb_array_length(COALESCE(f.asset_ids, '[]'::jsonb)) = 0
-			OR NOT EXISTS (
-				SELECT 1 FROM jsonb_array_elements_text(f.asset_ids) e(v)
-				JOIN assets a ON a.id = e.v::bigint
-			)
-		)`)
+		conds = append(conds, findingUnassignedAssetCond)
 	case len(f.assetIDs) > 0:
 		args = append(args, assetIDContainments(f.assetIDs))
 		conds = append(conds, fmt.Sprintf("f.asset_ids @> ANY($%d::jsonb[])", len(args)))
@@ -552,14 +577,35 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 type FindingStats struct {
 	Distinct *FindingDistinctStats `json:"distinct,omitempty"`
 
-	Total       int                 `json:"total"`
-	Pending     int                 `json:"pending"`
-	Critical    int                 `json:"critical"`
-	High        int                 `json:"high"`
-	Medium      int                 `json:"medium"`
-	Low         int                 `json:"low"`
-	VulnClasses []string            `json:"vulnclasses"`
-	Tasks       []FindingTaskOption `json:"tasks"` // 有漏洞的任务(供「按任务」下拉)
+	Total       int      `json:"total"`
+	Pending     int      `json:"pending"`
+	Critical    int      `json:"critical"`
+	High        int      `json:"high"`
+	Medium      int      `json:"medium"`
+	Low         int      `json:"low"`
+	VulnClasses []string `json:"vulnclasses"`
+	// VulnClassCounts 是「漏洞类型」下拉的条目:每个有漏洞的 vulnclass 及其条数。
+	// 只统计 findings 表(与列表严格对齐);归档任务里的类型仍会出现在
+	// VulnClasses 中,但没有对应条数,前端按「无计数」展示。
+	VulnClassCounts []FindingVulnClassOption `json:"vulnclass_counts"`
+	// VulnClassGroups 是归一化后的父类型计数(如 BOLA/IDOR)，发现页的「漏洞类型」
+	// 筛选下拉按它展示；原始 vulnclass 仍保留在 VulnClassCounts 中以便追溯。
+	VulnClassGroups []FindingVulnClassGroupOption `json:"vulnclass_groups"`
+	Tasks           []FindingTaskOption           `json:"tasks"` // 有漏洞的任务(供「按任务」下拉)
+}
+
+// FindingVulnClassOption is one entry in the 发现 page's 漏洞类型 filter:
+// a vuln class with at least one finding, plus its finding count.
+type FindingVulnClassOption struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+// FindingVulnClassGroupOption is one canonical parent vuln type (BOLA/IDOR, XSS…)
+// with the total finding count of all raw vulnclass labels mapped to it.
+type FindingVulnClassGroupOption struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 // FindingTaskOption is one entry in the 发现 page's 任务 filter: a task that has at
@@ -574,9 +620,9 @@ type FindingTaskOption struct {
 }
 
 // FindingStats returns whole-table counts (by severity + pending) and the sorted
-// set of distinct vuln classes.
+// set of distinct vuln classes with per-class finding counts.
 func (d *DB) FindingStats() (*FindingStats, error) {
-	st := &FindingStats{VulnClasses: []string{}, Tasks: []FindingTaskOption{}}
+	st := &FindingStats{VulnClasses: []string{}, VulnClassCounts: []FindingVulnClassOption{}, VulnClassGroups: []FindingVulnClassGroupOption{}, Tasks: []FindingTaskOption{}}
 	err := d.QueryRow(`SELECT
 		COUNT(*),
 		COUNT(*) FILTER (WHERE status = 'pending'),
@@ -588,21 +634,38 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := d.Query(`SELECT DISTINCT vulnclass FROM findings WHERE vulnclass <> '' ORDER BY vulnclass`)
+	rows, err := d.Query(`SELECT vulnclass, COUNT(*) FROM findings WHERE vulnclass <> '' GROUP BY vulnclass ORDER BY vulnclass`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var vc string
-		if err := rows.Scan(&vc); err != nil {
+		var opt FindingVulnClassOption
+		if err := rows.Scan(&opt.Name, &opt.Count); err != nil {
 			return nil, err
 		}
-		st.VulnClasses = append(st.VulnClasses, vc)
+		st.VulnClassCounts = append(st.VulnClassCounts, opt)
+		st.VulnClasses = append(st.VulnClasses, opt.Name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	// 把原始类型归一到父类型（同一漏洞的不同场景写法归入同一组）。
+	groupCounts := map[string]int{}
+	for _, opt := range st.VulnClassCounts {
+		groupCounts[CanonicalVulnClass(opt.Name)] += opt.Count
+	}
+	st.VulnClassGroups = make([]FindingVulnClassGroupOption, 0, len(groupCounts))
+	for name, count := range groupCounts {
+		st.VulnClassGroups = append(st.VulnClassGroups, FindingVulnClassGroupOption{Name: name, Count: count})
+	}
+	sort.SliceStable(st.VulnClassGroups, func(i, j int) bool {
+		if st.VulnClassGroups[i].Count != st.VulnClassGroups[j].Count {
+			return st.VulnClassGroups[i].Count > st.VulnClassGroups[j].Count
+		}
+		return st.VulnClassGroups[i].Name < st.VulnClassGroups[j].Name
+	})
 
 	// 任务下拉:有漏洞的任务,带描述(任务删除后为空,前端回退 id)和条数,最新有漏洞的排前。
 	trows, err := d.Query(`SELECT f.task_id, COALESCE(t.name, ''), COALESCE(t.description, ''), COUNT(*)
@@ -625,33 +688,12 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	if err := trows.Err(); err != nil {
 		return nil, err
 	}
-	archived, err := d.archivedTaskAggregates()
-	if err != nil {
-		return nil, err
-	}
-	vulnclasses := make(map[string]bool, len(st.VulnClasses))
-	for _, vulnclass := range st.VulnClasses {
-		vulnclasses[vulnclass] = true
-	}
-	for _, aggregate := range archived {
-		cold := aggregate.FindingStats
-		st.Total += cold.Total
-		st.Pending += cold.Pending
-		st.Critical += cold.Critical
-		st.High += cold.High
-		st.Medium += cold.Medium
-		st.Low += cold.Low
-		for _, vulnclass := range cold.VulnClasses {
-			if vulnclass != "" {
-				vulnclasses[vulnclass] = true
-			}
-		}
-	}
-	st.VulnClasses = st.VulnClasses[:0]
-	for vulnclass := range vulnclasses {
-		st.VulnClasses = append(st.VulnClasses, vulnclass)
-	}
-	sort.Strings(st.VulnClasses)
+	// 发现页的统计卡必须能与列表（ListFindingsPage / ListFindingGroups，只查
+	// findings 表）严格对上：卡片的 total/级别数就等于列表按同样条件能查出的条数。
+	// 因此这里**不并入**已归档任务的冷统计——归档时 findings 行已从表中删除
+	// （见 task_archives_restore.go），明细不可查，混入只会让「上报记录/级别」
+	// 大于实际能看到的条数，看起来像漏数据。归档口径的统计留在任务归档页，
+	// 由 ArchivedAggregateStats 单独展示。
 	return st, nil
 }
 

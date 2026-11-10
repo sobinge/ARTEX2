@@ -32,6 +32,9 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Severity:  normFilter(q.Get("severity")),
 		Status:    normFilter(q.Get("status")),
 		VulnClass: normFilter(q.Get("vulnclass")),
+		// vulnclass_group 是发现页下拉使用的归一化父类型（如 BOLA/IDOR）；
+		// vulnclass 仍保留精确文本筛选，供 API/旧链接使用。
+		VulnClassGroup: strings.TrimSpace(q.Get("vulnclass_group")),
 		// task_id(独立于会切到「按任务节点」分支的 task 参数):全局表按任务筛选。
 		TaskID:        normFilter(q.Get("task_id")),
 		Query:         q.Get("q"),
@@ -39,8 +42,22 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		TimeDirection: q.Get("time_direction"),
 		From:          strings.TrimSpace(q.Get("from")),
 		To:            strings.TrimSpace(q.Get("to")),
-		AssetScope:    strings.TrimSpace(q.Get("asset_scope")),
+		AssetScopes:   findingAssetScopesFromQuery(q),
 	}
+}
+
+// findingAssetScopesFromQuery 读取资产树多选 key。支持重复的 asset_scope 参数
+// （前端 URLSearchParams.append）以及单个参数里用逗号分隔的兼容写法。
+func findingAssetScopesFromQuery(q url.Values) []string {
+	var out []string
+	for _, raw := range q["asset_scope"] {
+		for _, part := range strings.Split(raw, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // findingAssetTree serves the「按资产」view's left-hand tree: every asset that

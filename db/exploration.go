@@ -319,6 +319,69 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 	return n, nil
 }
 
+// RunningIntentRef is one intent left in 'running' plus the moment it last showed
+// any sign of life. LastActive is the later of the node's own updated_at and the
+// newest activity row anchored to the intent, because a live worker mostly writes
+// facts/findings and activity records — it does not rewrite the intent row on
+// every step. Without folding activity in, a healthy long-running intent would
+// look stale.
+type RunningIntentRef struct {
+	ID         int64
+	LastActive time.Time
+}
+
+// RunningIntents lists this exploration's 'running' intents with their last sign
+// of life (oldest first).
+func (s *ExplorationStore) RunningIntents() ([]RunningIntentRef, error) {
+	rows, err := s.db.Query(`SELECT n.id,
+	GREATEST(n.updated_at, COALESCE((SELECT max(a.created_at) FROM activity a WHERE a.node_id = n.id), n.updated_at)) AS last_active
+FROM exploration_nodes n
+WHERE n.exploration_id=$1 AND n.kind='intent' AND n.state='running'
+ORDER BY last_active ASC`, s.expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunningIntentRef
+	for rows.Next() {
+		var it RunningIntentRef
+		if err := rows.Scan(&it.ID, &it.LastActive); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// StopRunningIntents force-closes every 'running' intent with reason attached.
+// Used when the task itself reached a terminal state: no worker will ever finish
+// those intents, and leaving them 'running' pins them in the UI as 进行中 forever
+// (they also cannot be re-run, because 重跑 only accepts blocked/exhausted/stopped).
+func (s *ExplorationStore) StopRunningIntents(reason string) (int64, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='stopped', completed_at=COALESCE(completed_at, now()), blocked_reason=NULLIF($2,''), content_version=content_version+1
+WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID, reason)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ReopenRunningIntent returns ONE stuck 'running' intent to 'open' so a live
+// worker re-claims it (the orphan watchdog only calls this when no work handle
+// owns the intent). Unlike ReopenIntent it deliberately accepts 'running'.
+func (s *ExplorationStore) ReopenRunningIntent(id int64) (bool, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL, content_version=content_version+1
+WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='running'`, id, s.expID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ReopenIntent flips ONE not-successfully-finished intent (blocked/exhausted/stopped)
 // back to 'open' so a worker re-claims it (graph writes it already produced stay).
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.

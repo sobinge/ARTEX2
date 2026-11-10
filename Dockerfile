@@ -1,42 +1,60 @@
 # syntax=docker/dockerfile:1
 #
-# 运行镜像（不在镜像里编译）：只装常用工具，放入**预编译好的 Linux 单二进制**。
-# 二进制由 CI 的 binaries job 交叉编译（纯 Go、无 QEMU），按目标架构放在
-# 构建上下文的 dist/<TARGETARCH>/artex。这样多架构构建时 arm64 只需模拟 apt 层，
-# 不再模拟 Next/Go 编译，速度快得多。
-#
-# 本地手动构建镜像时，先自行准备二进制：
-#   cd web && npm run build:static && cd ..
-#   cp -r web/out server/webui/dist
-#   CGO_ENABLED=0 GOARCH=amd64 go build -tags embedui -o dist/amd64/artex ./cmd/artex
-#   docker build -t artex:local .
-FROM python:3.12-slim-bookworm
+# 默认从源码构建：前端静态导出 → Go 单二进制（内嵌前端）→ 运行镜像。
+# 这样 `docker compose build`（或安装脚本）会包含当前目录的最新代码，而不是拉线上镜像。
+# 国内网络可覆盖依赖源：
+#   --build-arg GOPROXY=https://goproxy.cn,direct
+#   --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+
+########## 阶段 1：前端静态导出 ##########
+FROM node:20-bookworm AS web
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+WORKDIR /web
+# --ignore-scripts：跳过 prepare(husky)——容器里没有 .git，husky 会失败；
+# Next.js/Biome 的平台二进制走 optionalDependencies，不依赖生命周期脚本。
+COPY web/package.json web/package-lock.json ./
+RUN npm config set registry "$NPM_REGISTRY" && npm ci --ignore-scripts
+COPY web/ ./
+RUN NEXT_EXPORT=1 npm run build:static
+
+########## 阶段 2：Go 后端（内嵌前端，静态编译）##########
+FROM golang:1.26-bookworm AS gobuild
 ARG TARGETARCH
+ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
+WORKDIR /src
+COPY go.mod go.sum ./
+# go.mod 使用 replace => ./norma；必须在 go mod download 之前把本地 SDK 拷进来。
+COPY norma/ ./norma/
+RUN go env -w GOPROXY="$GOPROXY" && go mod download
+COPY . .
+# 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）
+COPY --from=web /web/out/ server/webui/dist/
+RUN mkdir -p /out && CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath -o /out/artex ./cmd/artex
+
+########## 阶段 3：运行镜像（工具 + Playwright 预装）##########
+FROM python:3.12-slim-bookworm
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ENV npm_config_registry=$NPM_REGISTRY \
+    PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
+    TZ=Asia/Shanghai
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 22.x，与前端构建使用的主版本一致。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
-      tzdata \
+      ca-certificates ripgrep curl wget vim git jq unzip tzdata \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
-# @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
-# @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
-# 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
-# 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
 RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-ENV TZ=Asia/Shanghai
-# 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
-COPY dist/${TARGETARCH}/artex /app/artex
-# 守护启动脚本：进程退出后按退出码决定是否重新拉起，页面一键更新靠它完成换装。
-# 它同时负责把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1，
-# 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
+# 构建阶段产出的单二进制（内嵌前端）
+COPY --from=gobuild /out/artex /app/artex
+# 守护启动脚本：进程退出后按退出码决定是否重新拉起。
+# 同时把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1。
 COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/

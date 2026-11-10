@@ -56,7 +56,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-import { AssetTree, assetPathOf } from "./_components/asset-tree";
+import { AssetTree } from "./_components/asset-tree";
 import {
   FINDING_STATUSES,
   type FindingEdit,
@@ -131,6 +131,8 @@ const EMPTY_STATS: FindingStats = {
   medium: 0,
   low: 0,
   vulnclasses: [],
+  vulnclass_counts: [],
+  vulnclass_groups: [],
   tasks: [],
 };
 
@@ -149,7 +151,10 @@ export default function FindingsPage() {
   const [flatPage, setFlatPage] = React.useState(1);
   const [flatPageSize, setFlatPageSize] = React.useState(20);
   const [assetTree, setAssetTree] = React.useState<AssetTreeState>(EMPTY_ASSET_TREE);
-  const [assetScope, setAssetScope] = React.useState<string | null>(null);
+  const [assetScopes, setAssetScopes] = React.useState<string[]>([]);
+  const toggleAssetScope = React.useCallback((key: string) => {
+    setAssetScopes((prev) => (prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key]));
+  }, []);
   const [groups, setGroups] = React.useState<FindingGroup[]>([]);
   const [groupTotal, setGroupTotal] = React.useState(0);
   const [expandedGroups, setExpandedGroups] = React.useState<Set<string>>(() => new Set());
@@ -317,12 +322,12 @@ export default function FindingsPage() {
         filters: {
           severity,
           status,
-          vulnclass,
+          vulnclassGroup: vulnclass,
           task,
           query,
           sort,
           ...dateRange,
-          assetScope: view === "asset" ? (assetScope ?? undefined) : undefined,
+          assetScopes: view === "asset" && assetScopes.length > 0 ? assetScopes : undefined,
         },
         ids: [...selectedIds],
         includeOriginals,
@@ -350,7 +355,7 @@ export default function FindingsPage() {
   visibleGroupKeysRef.current = new Set(groups.map(findingGroupKey));
 
   // 资产视图右侧列表 = 平铺列表 + 选中子树的筛选,所以两个视图共用一份列表状态。
-  const activeAssetScope = view === "asset" ? assetScope : null;
+  const activeAssetScopes = view === "asset" ? assetScopes : undefined;
 
   // loadFlat 拉取平铺视图的当前页;task 筛选交给后端,与分组视图共用同一批筛选条件。
   const loadFlat = React.useCallback(async () => {
@@ -365,11 +370,11 @@ export default function FindingsPage() {
           pageSize: flatPageSize,
           severity,
           status,
-          vulnclass,
+          vulnclassGroup: vulnclass,
           task,
           query,
           sort,
-          assetScope: activeAssetScope ?? undefined,
+          assetScopes: activeAssetScopes,
           ...dateRange,
         },
         true,
@@ -388,7 +393,7 @@ export default function FindingsPage() {
       setFlat((current) => ({ ...current, loading: false }));
     }
   }, [
-    activeAssetScope,
+    activeAssetScopes,
     dateRange,
     filterFingerprint,
     flatPage,
@@ -402,14 +407,14 @@ export default function FindingsPage() {
   ]);
 
   // loadAssetTree 取整棵资产树。树不随选中节点变化(否则选一下就塌成一条链),
-  // 所以这里不带 assetScope。
+  // 所以这里不带资产多选筛选。
   const loadAssetTree = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
     if (activeFilterFingerprint.current !== requestFilter) return;
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclass, task, query, sort, ...dateRange });
+      const result = await api.findingAssetTree({ severity, status, vulnclassGroup: vulnclass, task, query, sort, ...dateRange });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -436,7 +441,7 @@ export default function FindingsPage() {
         pageSize,
         severity,
         status,
-        vulnclass,
+        vulnclassGroup: vulnclass,
         task,
         query,
         sort,
@@ -476,7 +481,7 @@ export default function FindingsPage() {
             pageSize: groupPageSize,
             severity,
             status,
-            vulnclass,
+            vulnclassGroup: vulnclass,
             task: key,
             query,
             sort,
@@ -577,15 +582,15 @@ export default function FindingsPage() {
     setFlatPage(1);
     setFlat(EMPTY_FLAT_STATE);
     // 筛选变了树也会变,原先选中的节点可能已经不在树里,退回「全部资产」。
-    setAssetScope(null);
+    setAssetScopes([]);
     setAssetTree(EMPTY_ASSET_TREE);
   }, [filterFingerprint]);
 
   // 换资产节点等于换了一份结果集,回到第一页。
   React.useEffect(() => {
-    void assetScope;
+    void assetScopes;
     setFlatPage(1);
-  }, [assetScope]);
+  }, [assetScopes]);
 
   // 资产树只在进入视图 / 筛选变化时查一次(以及本页改动发现后由
   // refreshAfterMutation 主动重拉),不做轮询。
@@ -657,7 +662,7 @@ export default function FindingsPage() {
 
   React.useEffect(() => {
     if (!statsLoaded) return;
-    if (vulnclass !== "all" && !stats.vulnclasses.includes(vulnclass)) setVulnclass("all");
+    if (vulnclass !== "all" && !(stats.vulnclass_groups ?? []).some((g) => g.name === vulnclass)) setVulnclass("all");
     if (
       task !== "all" &&
       task !== UNASSIGNED_TASK &&
@@ -819,23 +824,34 @@ export default function FindingsPage() {
     }
   }
 
+  // 统计卡的口径必须与下方列表严格一致：列表只查 findings 表，按级别筛选返回的就是
+  // 该级别的原始上报行数。所以「上报记录」= stats.total(全表行数)，四个级别卡也用原始
+  // 行数 stats.critical/high/medium/low——点开筛选后卡片数字与列表条数相等。
+  // 「独立漏洞」是另一个口径（同一漏洞案例合并去重），用 hint 明确标注，避免被误读成
+  // 「列表应该只有这么多条」。此前级别卡优先取 distinct(去重) 值，与列表条数打架。
   const statCards = [
-    { label: "独立漏洞", value: stats.distinct?.total ?? stats.total, icon: BugIcon },
-    { label: "上报记录", value: stats.total, tone: "text-amber-500", icon: ClockIcon },
-    { label: "严重", value: stats.distinct?.critical ?? stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
-    { label: "高危", value: stats.distinct?.high ?? stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
-    { label: "中危", value: stats.distinct?.medium ?? stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
-    { label: "低危", value: stats.distinct?.low ?? stats.low, tone: "text-slate-500", icon: InfoIcon },
+    { label: "独立漏洞", value: stats.distinct?.total ?? stats.total, icon: BugIcon, tone: "", hint: "按同一漏洞案例合并去重后的数量（与列表条数口径不同）" },
+    { label: "上报记录", value: stats.total, tone: "text-amber-500", icon: ClockIcon, hint: "全部上报记录条数，与列表总条数一致" },
+    { label: "严重", value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon, hint: "严重级上报记录条数，与按严重筛选的列表条数一致" },
+    { label: "高危", value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon, hint: "高危级上报记录条数，与按高危筛选的列表条数一致" },
+    { label: "中危", value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon, hint: "中危级上报记录条数，与按中危筛选的列表条数一致" },
+    { label: "低危", value: stats.low, tone: "text-slate-500", icon: InfoIcon, hint: "低危级上报记录条数，与按低危筛选的列表条数一致" },
   ];
 
   // 导出弹窗里「当前筛选」的条数:两个视图的筛选一致,只是统计口径来源不同。
   // 平铺与资产视图共用 flat 列表状态,分组视图的口径来自组接口的 finding_total。
   const [caseTotal, setCaseTotal] = React.useState(0);
   const filteredTotal = view === "cases" ? caseTotal : view === "grouped" ? total : flat.total;
-  const assetPath = React.useMemo(
-    () => (view === "asset" ? assetPathOf(assetTree.nodes, assetScope) : []),
-    [assetScope, assetTree.nodes, view],
+  const selectedAssetNodes = React.useMemo(
+    () =>
+      view === "asset"
+        ? assetScopes
+            .map((key) => assetTree.nodes.find((node) => node.key === key))
+            .filter((node): node is FindingAssetNode => Boolean(node))
+        : [],
+    [assetScopes, assetTree.nodes, view],
   );
+  const selectedAssetSet = React.useMemo(() => new Set(assetScopes), [assetScopes]);
 
   const rowProps = {
     selectedIds,
@@ -910,7 +926,7 @@ export default function FindingsPage() {
           {statCards.map((stat) => {
             const StatIcon = stat.icon;
             return (
-              <Card key={stat.label} className="gap-1 py-4">
+              <Card key={stat.label} className="gap-1 py-4" title={stat.hint}>
                 <CardHeader className="px-4">
                   <CardDescription>{stat.label}</CardDescription>
                   <CardTitle className={cn("flex items-center gap-2 text-2xl tabular-nums", stat.tone)}>
@@ -972,9 +988,17 @@ export default function FindingsPage() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">全部类型</SelectItem>
-              {stats.vulnclasses.map((vc) => (
-                <SelectItem key={vc} value={vc}>
-                  {vc}
+              {(stats.vulnclass_groups ?? []).map((group) => (
+                <SelectItem key={group.name} value={group.name}>
+                  <span className="flex w-full items-center justify-between gap-2">
+                    <span className="max-w-[14rem] truncate" title={group.name}>
+                      {group.name}
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
+                      <BugIcon className="size-3.5" aria-hidden="true" />
+                      {group.count}
+                    </span>
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>
@@ -1060,8 +1084,9 @@ export default function FindingsPage() {
                 ) : (
                   <AssetTree
                     nodes={assetTree.nodes}
-                    selected={assetScope}
-                    onSelect={setAssetScope}
+                    selected={selectedAssetSet}
+                    onToggle={toggleAssetScope}
+                    onClear={() => setAssetScopes([])}
                     loading={assetTree.loading}
                     truncated={assetTree.truncated}
                     droppedKinds={assetTree.droppedKinds}
@@ -1075,27 +1100,34 @@ export default function FindingsPage() {
               <div className="flex min-w-0 flex-wrap items-center gap-1 text-sm text-muted-foreground">
                 <button
                   type="button"
-                  className={cn("hover:text-foreground", assetScope === null && "font-medium text-foreground")}
-                  onClick={() => setAssetScope(null)}
+                  className={cn("hover:text-foreground", assetScopes.length === 0 && "font-medium text-foreground")}
+                  onClick={() => setAssetScopes([])}
                 >
                   全部资产
                 </button>
-                {assetPath.map((node) => (
-                  <React.Fragment key={node.key}>
+                {selectedAssetNodes.length > 0 && (
+                  <>
                     <ChevronRightIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                    <span className="font-medium text-foreground">已选 {selectedAssetNodes.length} 个资产</span>
+                    {selectedAssetNodes.slice(0, 3).map((node) => (
+                      <span
+                        key={node.key}
+                        className="max-w-[12rem] truncate rounded bg-muted px-1.5 py-0.5 text-xs"
+                        title={node.label}
+                      >
+                        {node.label}
+                      </span>
+                    ))}
+                    {selectedAssetNodes.length > 3 && <span className="text-xs">等</span>}
                     <button
                       type="button"
-                      className={cn(
-                        "max-w-[16rem] truncate hover:text-foreground",
-                        node.key === assetScope && "font-medium text-foreground",
-                      )}
-                      title={node.label}
-                      onClick={() => setAssetScope(node.key)}
+                      className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                      onClick={() => setAssetScopes([])}
                     >
-                      {node.display}
+                      清除
                     </button>
-                  </React.Fragment>
-                ))}
+                  </>
+                )}
                 <span className="ml-auto shrink-0 text-xs tabular-nums">共 {flat.total} 条</span>
               </div>
               {flatListCard}
@@ -1106,7 +1138,7 @@ export default function FindingsPage() {
         {view === "cases" && (
           <FindingCaseList
             onTotal={setCaseTotal}
-            query={{ severity, status, vulnclass, task, query, sort, ...dateRange }}
+            query={{ severity, status, vulnclassGroup: vulnclass, task, query, sort, ...dateRange }}
             selectedIds={selectedIds}
             onSelect={toggleSelected}
           />

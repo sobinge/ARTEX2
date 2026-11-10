@@ -53,6 +53,10 @@ type FindingAssetTree struct {
 	// Truncated=true 表示为控制体积丢弃了 DroppedKinds 里的层级。
 	Truncated    bool     `json:"truncated"`
 	DroppedKinds []string `json:"dropped_kinds,omitempty"`
+
+	// Aliases 是「被合并的重复资产 key → 代表节点 key」，仅内部使用，不返回给前端。
+	// 筛选时要同时包含被合并资产的 id，否则会出现「树上计数 231、点开只有 23」的不一致。
+	Aliases map[string]string `json:"-"`
 }
 
 // assetRow 是构树需要的资产字段子集。
@@ -136,7 +140,11 @@ func (d *DB) BuildFindingAssetTree(f FindingFilter) (*FindingAssetTree, error) {
 // buildFindingAssetTree 是带节点上限的内部实现。maxNodes<=0 表示不截断——解析
 // AssetScope 时必须用这个模式,否则被丢掉的 endpoint 会让子树 id 集合不全。
 func (d *DB) buildFindingAssetTree(f FindingFilter, maxNodes int) (*FindingAssetTree, error) {
+	if err := d.applyVulnClassGroup(&f); err != nil {
+		return nil, err
+	}
 	f.AssetScope = ""
+	f.AssetScopes = nil
 	f.assetIDs, f.assetNone, f.assetMiss = nil, false, false
 	where, args := f.where()
 
@@ -179,6 +187,10 @@ FROM findings f LEFT JOIN tasks t ON f.task_id = t.id`+where, args...)
 	if err := d.attachCompanyNodes(nodes, parentOf); err != nil {
 		return nil, err
 	}
+	// 同名重复资产行合并成一个节点，避免同一子域名在树上出现两遍、子树归属
+	// 随机漂移（筛选不同请求得到不同数量）。aliases 用于把旧资产 id 的发现
+	// 计数到代表节点上。
+	aliases := mergeDuplicateAssetNodes(nodes, parentOf)
 
 	// 计数:一条发现沿它每个资产的祖先链向上,收集去重后的 key 集合再逐个 +1,
 	// 所以父节点不会因为一条发现挂了多个子资产而重复计数。
@@ -187,14 +199,24 @@ FROM findings f LEFT JOIN tasks t ON f.task_id = t.id`+where, args...)
 	for _, h := range hits {
 		clear(touched)
 		var direct []*FindingAssetNode
+		directSeen := map[string]bool{}
 		for _, id := range h.assetIDs {
-			node := nodes[assetKey(id)]
+			key := assetKey(id)
+			node := nodes[key]
+			if node == nil {
+				if alias, ok := aliases[key]; ok {
+					node = nodes[alias]
+				}
+			}
 			if node == nil {
 				continue
 			}
-			direct = append(direct, node)
-			for key := node.Key; key != ""; key = parentOf[key] {
-				touched[key] = true
+			if !directSeen[node.Key] {
+				directSeen[node.Key] = true
+				direct = append(direct, node)
+			}
+			for nk := node.Key; nk != ""; nk = parentOf[nk] {
+				touched[nk] = true
 			}
 		}
 		if len(direct) == 0 {
@@ -220,7 +242,49 @@ FROM findings f LEFT JOIN tasks t ON f.task_id = t.id`+where, args...)
 	}
 	sortFindingAssetNodes(tree.Nodes)
 	truncateFindingAssetTree(tree, maxNodes)
+	tree.Aliases = aliases
 	return tree, nil
+}
+
+// mergeDuplicateAssetNodes 合并同一父节点下 kind+label 相同的资产行（重复同步/
+// 历史数据造成的重复），保留最小 AssetID 作为代表；返回 被合并 key → 代表 key，
+// 用于把挂在旧资产 id 上的发现计数到代表节点。
+func mergeDuplicateAssetNodes(nodes map[string]*FindingAssetNode, parentOf map[string]string) map[string]string {
+	groups := map[string][]*FindingAssetNode{}
+	for _, n := range nodes {
+		if n.Kind == "company" || n.Kind == "none" {
+			continue
+		}
+		gk := n.Parent + "\x00" + n.Kind + "\x00" + n.Label
+		groups[gk] = append(groups[gk], n)
+	}
+	aliases := map[string]string{}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].AssetID != group[j].AssetID {
+				return group[i].AssetID < group[j].AssetID
+			}
+			return group[i].Key < group[j].Key
+		})
+		keeper := group[0]
+		for _, dup := range group[1:] {
+			aliases[dup.Key] = keeper.Key
+			delete(nodes, dup.Key)
+			delete(parentOf, dup.Key)
+		}
+	}
+	for key, parent := range parentOf {
+		if keeper, ok := aliases[parent]; ok {
+			parentOf[key] = keeper
+			if node := nodes[key]; node != nil {
+				node.Parent = keeper
+			}
+		}
+	}
+	return aliases
 }
 
 // countFinding 把一条发现累加到节点上(总数 / 严重度分桶 / 最近发现时间)。
@@ -439,7 +503,16 @@ func (d *DB) assembleFindingAssetNodes(byID map[int64]*assetRow) (map[string]*Fi
 	svcByHost := map[string]string{}
 	svcByHostPort := map[string]string{}
 
+	// 按资产 ID 升序处理，并对同名索引取「最小 ID」：库里可能存在多行同名资产
+	// （重复同步/历史数据），不能让 map 遍历顺序决定 service 挂到哪一行，否则
+	// 同一筛选的计数会在多请求间来回变化。
+	rows := make([]*assetRow, 0, len(byID))
 	for _, a := range byID {
+		rows = append(rows, a)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+
+	for _, a := range rows {
 		key := assetKey(a.id)
 		nodes[key] = &FindingAssetNode{
 			Key: key, Kind: a.kind, Label: a.label(),
@@ -448,26 +521,36 @@ func (d *DB) assembleFindingAssetNodes(byID map[int64]*assetRow) (map[string]*Fi
 		switch a.kind {
 		case "root_domain":
 			if a.domain != "" {
-				rootByDomain[a.domain] = key
+				if _, ok := rootByDomain[a.domain]; !ok {
+					rootByDomain[a.domain] = key
+				}
 			}
 		case "subdomain":
 			if a.domain != "" {
-				subByDomain[a.domain] = key
+				if _, ok := subByDomain[a.domain]; !ok {
+					subByDomain[a.domain] = key
+				}
 			}
 		case "ip":
 			if a.ip != "" {
-				ipByAddr[a.ip] = key
+				if _, ok := ipByAddr[a.ip]; !ok {
+					ipByAddr[a.ip] = key
+				}
 			}
 		case "service":
 			if host, port := a.hostPort(); host != "" {
-				svcByHost[host] = key
-				svcByHostPort[host+"|"+strconv.Itoa(port)] = key
+				if _, ok := svcByHost[host]; !ok {
+					svcByHost[host] = key
+				}
+				if _, ok := svcByHostPort[host+"|"+strconv.Itoa(port)]; !ok {
+					svcByHostPort[host+"|"+strconv.Itoa(port)] = key
+				}
 			}
 		}
 	}
 
 	// 子域名的根域名在库里没有资产行时,合成一个占位根,免得子域名散成顶层。
-	for _, a := range byID {
+	for _, a := range rows {
 		if a.kind != "subdomain" || a.rootDomain == "" {
 			continue
 		}
@@ -489,7 +572,7 @@ func (d *DB) assembleFindingAssetNodes(byID map[int64]*assetRow) (map[string]*Fi
 		}
 		return ""
 	}
-	for _, a := range byID {
+	for _, a := range rows {
 		key := assetKey(a.id)
 		var parent string
 		switch a.kind {
@@ -615,18 +698,40 @@ func truncateFindingAssetTree(tree *FindingAssetTree, maxNodes int) {
 	}
 }
 
-// applyAssetScope 把 AssetScope(节点 key)解析成可用于 SQL 的资产 id 集合。选中
-// 一个节点等于选中它的整棵子树,所以要先把树建出来再收集子孙。
+// applyAssetScope 把 AssetScope/AssetScopes（节点 key）解析成可用于 SQL 的资产 id
+// 集合。选中一个节点等于选中它的整棵子树；多选时取所有子树的并集。
 func (d *DB) applyAssetScope(f FindingFilter) (FindingFilter, error) {
-	scope := strings.TrimSpace(f.AssetScope)
+	if err := d.applyVulnClassGroup(&f); err != nil {
+		return f, err
+	}
+	scopes := make([]string, 0, len(f.AssetScopes)+1)
+	for _, raw := range f.AssetScopes {
+		if s := strings.TrimSpace(raw); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	if len(scopes) == 0 {
+		if s := strings.TrimSpace(f.AssetScope); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
 	f.assetIDs, f.assetNone, f.assetMiss = nil, false, false
-	if scope == "" {
+	if len(scopes) == 0 {
 		return f, nil
 	}
-	if scope == FindingUnassignedAsset {
-		f.assetNone = true
+
+	keys := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope == FindingUnassignedAsset {
+			f.assetNone = true
+			continue
+		}
+		keys = append(keys, scope)
+	}
+	if len(keys) == 0 {
 		return f, nil
 	}
+
 	// 不截断:被丢掉的 endpoint 同样要参与 id 收集,否则列表会少数据。
 	tree, err := d.buildFindingAssetTree(f, 0)
 	if err != nil {
@@ -638,28 +743,50 @@ func (d *DB) applyAssetScope(f FindingFilter) (FindingFilter, error) {
 		byKey[n.Key] = n
 		children[n.Parent] = append(children[n.Parent], n)
 	}
-	if _, ok := byKey[scope]; !ok {
-		// 选中的节点在当前筛选下已经不存在,结果应当为空而不是退化成不过滤。
-		f.assetMiss = true
-		return f, nil
-	}
-	seen := map[string]bool{scope: true}
-	queue := []string{scope}
-	for len(queue) > 0 {
-		key := queue[0]
-		queue = queue[1:]
-		if id := byKey[key].AssetID; id > 0 {
-			f.assetIDs = append(f.assetIDs, id)
+
+	idSet := map[int64]bool{}
+	// 被合并的重复资产 key(a:<id>) → 代表节点；筛选时把它们的 id 一并纳入，
+	// 保证「树上计数」与「点开后的列表」一致。
+	dupsByKeeper := map[string][]int64{}
+	for dupKey, keeper := range tree.Aliases {
+		if id, err := strconv.ParseInt(strings.TrimPrefix(dupKey, "a:"), 10, 64); err == nil && id > 0 {
+			dupsByKeeper[keeper] = append(dupsByKeeper[keeper], id)
 		}
-		for _, child := range children[key] {
-			if seen[child.Key] {
-				continue
+	}
+	for _, scope := range keys {
+		if keeper, ok := tree.Aliases[scope]; ok {
+			scope = keeper
+		}
+		if _, ok := byKey[scope]; !ok {
+			// 选中的节点在当前筛选下已经不存在（例如筛选变更后被裁掉），
+			// 忽略该节点；若所有节点都不存在，最终结果为恒空。
+			continue
+		}
+		seen := map[string]bool{scope: true}
+		queue := []string{scope}
+		for len(queue) > 0 {
+			key := queue[0]
+			queue = queue[1:]
+			if id := byKey[key].AssetID; id > 0 {
+				idSet[id] = true
 			}
-			seen[child.Key] = true
-			queue = append(queue, child.Key)
+			for _, dupID := range dupsByKeeper[key] {
+				idSet[dupID] = true
+			}
+			for _, child := range children[key] {
+				if seen[child.Key] {
+					continue
+				}
+				seen[child.Key] = true
+				queue = append(queue, child.Key)
+			}
 		}
 	}
-	if len(f.assetIDs) == 0 {
+	f.assetIDs = make([]int64, 0, len(idSet))
+	for id := range idSet {
+		f.assetIDs = append(f.assetIDs, id)
+	}
+	if len(f.assetIDs) == 0 && !f.assetNone {
 		f.assetMiss = true
 	}
 	return f, nil

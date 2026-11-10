@@ -384,6 +384,9 @@ func ExpandWorkerSlots(pools []WorkerPool, legacy int) ([]WorkerSlot, error) {
 		if legacy <= 0 {
 			legacy = defaultWorkers
 		}
+		if legacy > pgdb.MaxTaskWorkerCount {
+			legacy = pgdb.MaxTaskWorkerCount
+		}
 		slots := make([]WorkerSlot, legacy)
 		for i := range slots {
 			slots[i] = WorkerSlot{Name: fmt.Sprintf("work#%d", i+1)}
@@ -430,7 +433,8 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 }
 
 // Workers returns the configured concurrent work-agent count (default 3). Read
-// per-task at engine.Run, so a change applies to tasks started afterwards.
+// when a task starts and re-applied to running tasks by
+// Engine.ReconcileAllWorkers, so a settings change takes effect live.
 func (m *Manager) Workers() int {
 	v, ok, err := m.pg.GetSetting(settingWorkers)
 	if err != nil || !ok {

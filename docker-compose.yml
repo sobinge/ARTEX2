@@ -15,7 +15,15 @@ services:
     restart: unless-stopped
 
   artex:
-    image: ${ARTEX_IMAGE:-ruoji6/artex}:${ARTEX_TAG:-latest}
+    # 默认用本地源码构建的镜像（包含本目录最新代码），不再默认拉线上镜像。
+    # 如需官方发布镜像：ARTEX_IMAGE=ruoji6/artex ARTEX_TAG=latest docker compose up -d（不加 --build）
+    image: ${ARTEX_IMAGE:-artex-local}:${ARTEX_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     depends_on:
       postgres:
         condition: service_healthy

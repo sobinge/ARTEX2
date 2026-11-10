@@ -50,6 +50,8 @@ var (
 		"用户删除了正在运行的 Worker。本次调用被取消；Worker 退出写入区后，服务端按用户选择的删除模式处理该意图——假删除仅标记为已删除并保留全部产出，真删除会级联移除该意图及仅由它支撑的下游节点")
 	AbortWorkFinished = cause("work_finished", "Worker 已正常结束并释放 context",
 		"Worker 已正常结束，引擎在 detachWork 中释放其 context 资源。这不是运行中断；若它出现在中断消息中，说明取消与收场事件发生了竞态")
+	AbortWorkStale = cause("work_stale", "意图长时间无任何进展，看门狗判定僵死",
+		"引擎看门狗发现这条意图已超过 15 分钟既无状态写入也无活动记录，通常意味着模型请求或 HTTP 连接挂起（半开连接、网关黑洞）。看门狗取消该次运行，意图退回 frontier(open) 后由新的 Worker 从 transcript 续跑")
 	AbortPausedRaceGuard = cause("paused_race_guard", "任务暂停期间拒绝启动新运行",
 		"任务处于暂停状态时，引擎拒绝发出新的执行 context，用于防止 claim 与暂停之间的竞态导致 Worker 继续启动；已领取的意图会退回 frontier")
 

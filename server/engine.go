@@ -150,7 +150,13 @@ type Engine struct {
 	resolveAuthoritative bool
 	workerResolve        func(t *Task, slot WorkerSlot) (*agent.Worker, error)
 	slotState            sync.Map // task/slot -> slotAvailability
-	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
+	slotPlans            sync.Map // task -> map[slot name]profile ID; refreshed on live rescale
+	// Live worker-pool scaling (see ReconcileTaskWorkers): the running worker loops
+	// per task, keyed by slot name, so a settings change can grow/shrink the pool
+	// without restarting the task.
+	workerMu     sync.Mutex
+	workerSlots  map[string]map[string]*workerSlotState // taskID -> slot name -> live loop
+	retiredSlots sync.Map                               // *workerSlotState -> struct{}, stop after current step
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
@@ -165,6 +171,14 @@ type taskRuntime struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// workerSlotState is one live worker loop. cancel stops it at the next loop tick;
+// a retire request (retiredSlots) lets it finish the current step first.
+type workerSlotState struct {
+	slot   WorkerSlot
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type workExecution struct {
@@ -403,10 +417,136 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
-		runtimes: map[string]*taskRuntime{}}
+		runtimes: map[string]*taskRuntime{}, workerSlots: map[string]map[string]*workerSlotState{}}
+	if m != nil {
+		// Safety net: pick up workers / worker_pools changes that did not go through
+		// the settings API (direct DB edits, restored backups) within a few seconds.
+		go e.workerReconcileLoop()
+	}
+	return e
+}
+
+// workerReconcileLoop periodically re-applies the configured worker count to the
+// running task loops, so concurrency follows the setting even outside the API path.
+// Every 6th tick (≈60s) it also runs the intent watchdog, which rescues intents
+// that no worker will ever finish.
+func (e *Engine) workerReconcileLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for i := 1; ; i++ {
+		<-ticker.C
+		e.ReconcileAllWorkers()
+		if i%6 == 0 {
+			e.ReapStaleIntents()
+		}
+	}
+}
+
+// staleIntentAfter bounds how long a 'running' intent may sit without any row
+// update before the watchdog treats it as orphaned. A live worker keeps rewriting
+// the node (and emitting activity) well inside this window, so the value is
+// deliberately generous — a false positive would re-run an intent already working.
+const staleIntentAfter = 15 * time.Minute
+
+// hasActiveWork reports whether an execution handle currently owns intentID.
+func (e *Engine) hasActiveWork(intentID int64) bool {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	_, ok := e.work[intentID]
+	return ok
+}
+
+// cancelWork cancels the live execution of intentID with the given cause, if any.
+// Returns false when no handle owns the intent (nothing to cancel).
+func (e *Engine) cancelWork(intentID int64, cause error) bool {
+	e.workMu.Lock()
+	run := e.work[intentID]
+	e.workMu.Unlock()
+	if run == nil {
+		return false
+	}
+	run.cancel(cause)
+	return true
+}
+
+// ReapStaleIntents is the safety net for intents no worker will ever finish — the
+// "死意图" that stays 进行中 in the UI forever. Three shapes are covered:
+//
+//  1. task reached a terminal status (done/failed/timeout): its running intents can
+//     never complete, so they are force-closed as stopped (re-runnable by hand).
+//  2. task is not running in this process (never started / stopped / queued): the
+//     running intents go back to open so the next Run() re-claims them.
+//  3. task is running but an intent has no execution handle AND has not been
+//     touched for staleIntentAfter: the worker goroutine is wedged (typically a
+//     hung LLM HTTP call). The intent returns to open and a healthy worker re-claims
+//     it, resuming from its transcript.
+//
+// Intents owned by a live execution handle are never touched, so a slow-but-alive
+// step cannot be disturbed.
+func (e *Engine) ReapStaleIntents() {
+	if e == nil || e.m == nil {
+		return
+	}
+	for _, t := range e.m.List() {
+		if t == nil {
+			continue
+		}
+		refs, err := t.Store.RunningIntents()
+		if err != nil || len(refs) == 0 {
+			continue
+		}
+		status := e.m.TaskStatus(t.ID)
+		if isTerminalStatus(status) {
+			n, err := t.Store.StopRunningIntents("任务已结束，自动收尾未完成的意图")
+			if err == nil && n > 0 {
+				log.Printf("[watchdog] task %s 任务终态(%s)，%d 个残留 running 意图置为 stopped", t.ID, status, n)
+				e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+					Summary: fmt.Sprintf("任务已结束，%d 条未完成的意图已自动置为「已停止」，需要时可手动重跑", n)})
+			}
+			continue
+		}
+		if _, live := e.started.Load(t.ID); !live {
+			if n, err := t.Store.ResetRunningIntents(); err == nil && n > 0 {
+				log.Printf("[watchdog] task %s 无存活的 worker 循环，%d 个残留 running 意图回退为 open", t.ID, n)
+			}
+			continue
+		}
+		if e.IsPaused(t.ID) {
+			continue // 暂停期间不动：恢复后 worker 会接着跑
+		}
+		for _, ref := range refs {
+			age := time.Since(ref.LastActive)
+			if age < staleIntentAfter {
+				continue
+			}
+			// 还有执行句柄却长时间毫无进展 = worker goroutine 卡在挂起的 LLM/网络
+			// 调用上。取消这次运行；runIntent 收尾会把意图交回 frontier(open)，由
+			// 新的 worker 从 transcript 续跑。不断言"卡住了就直接放弃"。
+			if e.hasActiveWork(ref.ID) {
+				if e.cancelWork(ref.ID, agent.AbortWorkStale) {
+					log.Printf("[watchdog] task %s 意图 #%d 已 %s 无进展，取消僵死的执行（worker 疑似卡在挂起的模型请求上）",
+						t.ID, ref.ID, age.Truncate(time.Second))
+					iid := ref.ID
+					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", NodeID: &iid, IsError: true,
+						Summary: fmt.Sprintf("意图 #%d 已 %d 分钟无任何进展，判定为模型/网络挂起：已中断本次运行并重新排队", iid, int(age.Minutes()))})
+				}
+				continue
+			}
+			// 没有执行句柄 = 这条 running 没有任何 worker 在跑，直接回 open 重新领取。
+			ok, err := t.Store.ReopenRunningIntent(ref.ID)
+			if err != nil || !ok {
+				continue
+			}
+			log.Printf("[watchdog] task %s 意图 #%d 已 %s 无进展且无执行句柄，判定僵死，回退为 open 重新领取",
+				t.ID, ref.ID, age.Truncate(time.Second))
+			iid := ref.ID
+			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", NodeID: &iid,
+				Summary: fmt.Sprintf("意图 #%d 长时间无进展（疑似 LLM/网络挂起），已自动重新排队执行", iid)})
+		}
+	}
 }
 
 // registerWork records the cancel for the work currently running intentID.
@@ -817,10 +957,8 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
-	for _, slot := range slots {
-		slot := slot
-		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, slot) })
-	}
+	e.startWorkerSlots(rt, t, slots, true)
+	log.Printf("[engine] task %s started: planner + %d workers", t.ID, len(slots))
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
 	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
 	// 是 open,或已被上面刚起的 worker 抢先 claim 成 running——两种都算「有活干」,一律跳过
@@ -830,6 +968,162 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	if has, _ := t.Store.HasActiveIntent(); !has {
 		t.Notify() // kick the first planning round (acted on once LLM is ready)
 	}
+}
+
+// startWorkerSlots launches (or reuses) the worker loops for the given slots.
+// Run and ReconcileTaskWorkers share this path so startup and live rescale behave
+// identically. reserved=true means the caller already added len(slots) to the
+// task WaitGroup (the Run path, which registers planner+workers atomically under
+// deleteMu); callers holding deleteMu for reading pass reserved=false and the wg
+// reservation happens here, still under that lock so StopTask cannot race Wait.
+func (e *Engine) startWorkerSlots(rt *taskRuntime, t *Task, slots []WorkerSlot, reserved bool) {
+	e.workerMu.Lock()
+	states := e.workerSlots[t.ID]
+	if states == nil {
+		states = make(map[string]*workerSlotState, len(slots))
+		e.workerSlots[t.ID] = states
+	}
+	toStart := make([]*workerSlotState, 0, len(slots))
+	for _, slot := range slots {
+		if st, ok := states[slot.Name]; ok && st.slot.ProfileID == slot.ProfileID {
+			continue // already running with the same routing
+		}
+		ctx, cancel := context.WithCancel(rt.ctx)
+		st := &workerSlotState{slot: slot, ctx: ctx, cancel: cancel}
+		states[slot.Name] = st
+		toStart = append(toStart, st)
+	}
+	e.workerMu.Unlock()
+	if len(toStart) == 0 {
+		return
+	}
+	if !reserved {
+		e.registerTaskRoutines(rt.ctx, t.ID, len(toStart))
+	}
+	for _, st := range toStart {
+		st := st
+		runTaskRoutine(rt, func(context.Context) {
+			defer e.forgetWorkerSlot(t.ID, st)
+			e.workerLoop(st.ctx, t, st.slot, st)
+		})
+	}
+}
+
+// forgetWorkerSlot drops the bookkeeping for one exited loop. The identity check
+// keeps a retiring loop from deleting a replacement that reused its slot name.
+func (e *Engine) forgetWorkerSlot(taskID string, st *workerSlotState) {
+	st.cancel()
+	e.retiredSlots.Delete(st)
+	e.workerMu.Lock()
+	if states := e.workerSlots[taskID]; states != nil {
+		if cur, ok := states[st.slot.Name]; ok && cur == st {
+			delete(states, st.slot.Name)
+		}
+		if len(states) == 0 {
+			delete(e.workerSlots, taskID)
+		}
+	}
+	e.workerMu.Unlock()
+}
+
+// ReconcileTaskWorkers applies the current workers / worker_pools setting to one
+// running task in place. Slots that disappeared (or moved to another LLM profile)
+// are retired gracefully after their current step; new slots start immediately.
+// Tasks that are not running, or are being deleted, are left untouched. Tasks with
+// an explicit per-task worker_count keep their override by design.
+func (e *Engine) ReconcileTaskWorkers(taskID string) {
+	if e == nil || e.m == nil {
+		return
+	}
+	t, ok := e.m.Task(taskID)
+	if !ok {
+		return
+	}
+	slots, err := workerSlotsForTask(t, e.m.WorkerPools(), e.m.Workers())
+	if err != nil {
+		log.Printf("[engine] task %s worker slots invalid during rescale: %v", taskID, err)
+		return
+	}
+	e.deleteMu.RLock()
+	defer e.deleteMu.RUnlock()
+	if e.IsDeleting(taskID) {
+		return
+	}
+	if _, running := e.started.Load(taskID); !running {
+		return
+	}
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	e.runtimeMu.Unlock()
+	if rt == nil {
+		return
+	}
+
+	desired := make(map[string]WorkerSlot, len(slots))
+	for _, slot := range slots {
+		desired[slot.Name] = slot
+	}
+	e.workerMu.Lock()
+	states := e.workerSlots[taskID]
+	if states == nil {
+		states = make(map[string]*workerSlotState, len(slots))
+		e.workerSlots[taskID] = states
+	}
+	retired := 0
+	for name, st := range states {
+		want, keep := desired[name]
+		if keep && want.ProfileID == st.slot.ProfileID {
+			continue
+		}
+		e.retiredSlots.Store(st, struct{}{})
+		delete(states, name)
+		retired++
+	}
+	toStart := make([]*workerSlotState, 0, len(desired))
+	for name, slot := range desired {
+		if _, ok := states[name]; ok {
+			continue
+		}
+		ctx, cancel := context.WithCancel(rt.ctx)
+		st := &workerSlotState{slot: slot, ctx: ctx, cancel: cancel}
+		states[name] = st
+		toStart = append(toStart, st)
+	}
+	e.workerMu.Unlock()
+
+	if len(toStart) > 0 {
+		e.registerTaskRoutines(rt.ctx, taskID, len(toStart))
+		for _, st := range toStart {
+			st := st
+			runTaskRoutine(rt, func(context.Context) {
+				defer e.forgetWorkerSlot(taskID, st)
+				e.workerLoop(st.ctx, t, st.slot, st)
+			})
+		}
+	}
+	plan := make(map[string]int64, len(slots))
+	for _, slot := range slots {
+		plan[slot.Name] = slot.ProfileID
+	}
+	e.slotPlans.Store(taskID, plan)
+	if len(toStart) > 0 || retired > 0 {
+		log.Printf("[engine] task %s workers rescaled: running=%d started=%d retiring=%d", taskID, len(desired), len(toStart), retired)
+	}
+}
+
+// ReconcileAllWorkers re-applies the current worker setting to every running task.
+// The settings API calls this immediately after a save; a 10s ticker (see
+// NewEngine) also calls it as a safety net for direct database edits.
+func (e *Engine) ReconcileAllWorkers() {
+	if e == nil {
+		return
+	}
+	e.started.Range(func(k, _ any) bool {
+		if id, ok := k.(string); ok {
+			e.ReconcileTaskWorkers(id)
+		}
+		return true
+	})
 }
 
 // workerSlotsForTask preserves an explicit task concurrency override. Tasks
@@ -993,13 +1287,18 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	}
 }
 
-func (e *Engine) workerLoop(ctx context.Context, t *Task, slot WorkerSlot) {
+func (e *Engine) workerLoop(ctx context.Context, t *Task, slot WorkerSlot, st *workerSlotState) {
 	name := slot.Name
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		// Live rescale down: finish the current step, then leave before claiming
+		// another intent. Never interrupts work that is already executing.
+		if _, retired := e.retiredSlots.Load(st); retired {
+			return
 		}
 		var worker *agent.Worker
 		var resolveErr error
@@ -1187,6 +1486,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 已停止，等待取消清理", name, t.ID, intent.ID)
 		e.touch(t.ID)
+		return true
+	}
+	// 看门狗判定这条 work 僵死（模型请求/HTTP 挂起）后取消了它：把意图交回 frontier
+	// 自动重跑，而不是停在 stopped 等人工点「重跑」。任务本身没暂停/没终止时 worker
+	// 会立刻再领一次，并从 transcript 续跑。
+	if ectx.Err() == nil && errors.Is(workCause, agent.AbortWorkStale) {
+		if stateErr := transitionIntentState(t.Store, intent.ID, "running", "open"); stateErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 僵死回退失败: %v", name, t.ID, intent.ID, stateErr)
+		}
+		log.Printf("[worker %s] task %s 意图 #%d 因僵死被中断，已重新排队", name, t.ID, intent.ID)
+		e.touch(t.ID)
+		t.Notify()
 		return true
 	}
 	// if a pause cancelled this run mid-flight, return the intent to the frontier

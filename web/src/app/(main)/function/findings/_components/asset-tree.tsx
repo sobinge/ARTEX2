@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import type { FindingAssetKind, FindingAssetNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -171,8 +172,9 @@ function collectKeys(nodes: TreeNode[], out: Set<string> = new Set()): Set<strin
 
 interface AssetTreeProps {
   nodes: FindingAssetNode[];
-  selected: string | null;
-  onSelect: (key: string | null) => void;
+  selected: Set<string>;
+  onToggle: (key: string) => void;
+  onClear: () => void;
   loading?: boolean;
   truncated?: boolean;
   droppedKinds?: string[];
@@ -185,7 +187,8 @@ interface AssetTreeProps {
 export function AssetTree({
   nodes,
   selected,
-  onSelect,
+  onToggle,
+  onClear,
   loading,
   truncated,
   droppedKinds,
@@ -246,9 +249,9 @@ export function AssetTree({
           key={node.key}
           node={node}
           open={open}
-          selected={selected === node.key}
+          selected={selected.has(node.key)}
           onToggle={() => toggle(node)}
-          onSelect={() => onSelect(selected === node.key ? null : node.key)}
+          onSelect={() => onToggle(node.key)}
         />,
       );
       if (open && node.children.length > 0) pushRows(node.children);
@@ -288,15 +291,24 @@ export function AssetTree({
 
       <button
         type="button"
-        onClick={() => onSelect(null)}
+        onClick={onClear}
         className={cn(
           "flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm",
-          selected === null ? "bg-accent font-medium" : "hover:bg-accent/50",
+          selected.size === 0 ? "bg-accent font-medium" : "hover:bg-accent/50",
         )}
       >
         <span>全部资产</span>
         <span className="text-xs tabular-nums text-muted-foreground">{findingTotal}</span>
       </button>
+
+      {selected.size > 0 && (
+        <div className="flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
+          <span>已选 {selected.size} 个资产（取并集）</span>
+          <button type="button" className="underline-offset-2 hover:text-foreground hover:underline" onClick={onClear}>
+            清除
+          </button>
+        </div>
+      )}
 
       <div className="max-h-[24rem] min-h-0 flex-1 overflow-y-auto pr-2 lg:max-h-[calc(100vh-16rem)]">
         <div className="flex flex-col">
@@ -351,6 +363,12 @@ function AssetTreeRow({
       ) : (
         <span className="size-5 shrink-0" />
       )}
+      <Checkbox
+        checked={selected}
+        onCheckedChange={() => onSelect()}
+        aria-label={selected ? "取消选择该资产" : "选择该资产"}
+        className="size-3.5 shrink-0"
+      />
       <button
         type="button"
         onClick={onSelect}

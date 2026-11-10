@@ -240,13 +240,17 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.severity && q.severity !== "all") p.set("severity", q.severity);
   if (q.status && q.status !== "all") p.set("status", q.status);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
+  if (q.vulnclassGroup && q.vulnclassGroup !== "all") p.set("vulnclass_group", q.vulnclassGroup);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.timeDirection) p.set("time_direction", q.timeDirection);
   if (q.from) p.set("from", q.from);
   if (q.to) p.set("to", q.to);
-  if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.assetScope) p.append("asset_scope", q.assetScope);
+  for (const scope of q.assetScopes ?? []) {
+    if (scope) p.append("asset_scope", scope);
+  }
   return p;
 }
 
@@ -693,7 +697,8 @@ export const api = {
     if (opts.scope === "selected") {
       p.set("ids", (opts.ids ?? []).join(","));
     } else if (opts.scope === "filtered" && opts.filters) {
-      for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
+      // 保留重复参数(如多选资产的 asset_scope),不能用 set 覆盖成最后一个。
+      for (const [k, v] of findingFilterParams(opts.filters)) p.append(k, v);
     }
     const token = getToken();
     const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {

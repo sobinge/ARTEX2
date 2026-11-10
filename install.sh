@@ -46,11 +46,12 @@ install_docker(){
   else
     info "沿用已存在的 .env"
   fi
-  info "拉取镜像并启动…"
-  docker compose pull
-  docker compose up -d
+  info "从当前源码构建镜像并启动（包含本地最新改动）…"
+  docker compose build
+  docker compose up -d --no-build
   ok "启动完成 → http://localhost:8787"
   info "查看日志：docker compose logs -f artex"
+  info "如需改用官方发布镜像：ARTEX_IMAGE=ruoji6/artex docker compose pull artex && docker compose up -d --no-build"
 }
 
 # ── ② 本地编译运行 ──────────────────────────────

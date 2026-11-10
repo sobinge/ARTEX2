@@ -322,6 +322,9 @@ func (s *Server) restoreTaskRuntimes() {
 			s.engine.Run(s.ctx, t)
 		}
 	}
+	// 启动后立刻跑一次意图看门狗：把终态任务里残留的 running 意图收尾，并让
+	// 「无 worker 却停在 running」的意图回到 open，避免它们永久显示「进行中」。
+	go s.engine.ReapStaleIntents()
 }
 
 // agentMaxTurns returns the configured max_turns for an agent key (0 = unlimited,
@@ -3532,7 +3535,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"global_proxy":                         s.m.GlobalProxy(), // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"show_egress_ip":                       s.m.pg.GetBool(settingShowEgressIP, false),
 		"python_interpreter":                   strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                              s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"workers":                              s.m.Workers(),               // 并发工作 agent 数(默认3)；运行中的任务会实时扩缩容
 		"worker_pools":                         s.m.WorkerPools(),           // 非空时按池顺序绑定 worker 会话
 		"task_concurrency_enabled":             concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":               concLimit,                   // 同时运行任务上限(开启后默认5)
@@ -3691,6 +3694,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	// A non-empty pool list takes precedence when both fields are present and
 	// synchronizes workers to its total. An empty list clears pools; when workers
 	// is also present it sets the legacy count for the newly restored legacy mode.
+	workersChanged := false
 	if req.WorkerPools != nil {
 		if len(*req.WorkerPools) == 0 && req.Workers != nil && *req.Workers <= 0 {
 			writeErr(w, 400, "workers 必须 >0")
@@ -3704,6 +3708,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, err.Error())
 			return
 		}
+		workersChanged = true
 	} else if req.Workers != nil {
 		// An omitted worker_pools field leaves the saved mode unchanged. If a
 		// non-empty pool configuration is already saved, its total remains the
@@ -3713,7 +3718,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, err.Error())
 				return
 			}
+			workersChanged = true
 		}
+	}
+	if workersChanged {
+		// Apply the new concurrency to tasks that are already running instead of
+		// waiting for their next restart.
+		go s.engine.ReconcileAllWorkers()
 	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
 		// 部分 PUT:未给的字段用当前值兜底,避免只改一个把另一个重置。

@@ -431,7 +431,18 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	// 单次模型调用必须能在“服务端不返回”时自己退出。http.DefaultTransport 的
+	// ResponseHeaderTimeout 为 0、Client 也没有 Timeout：网关把连接建好后迟迟不吐
+	// 第一个 SSE 帧（限流挂起、半开连接、LB 黑洞），worker goroutine 就会永久阻塞，
+	// 意图一直停在 running —— 前端看到的就是「意图卡死、任务死住」。
+	// 这里给首字节等待和整体调用都设上限：首字节 120s，整体 15min（够长响应，
+	// 超出即视为挂死，走模型错误重试/收尾路径，不会无限期占用 worker）。
+	transport.ResponseHeaderTimeout = 120 * time.Second
+	transport.TLSHandshakeTimeout = 30 * time.Second
+	return &http.Client{
+		Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)},
+		Timeout:   15 * time.Minute,
+	}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a

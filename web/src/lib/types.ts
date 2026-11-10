@@ -585,7 +585,21 @@ export interface FindingStats {
   medium: number;
   low: number;
   vulnclasses: string[];
+  vulnclass_counts?: FindingVulnClassOption[];
+  vulnclass_groups?: FindingVulnClassGroupOption[];
   tasks: FindingTaskOption[];
+}
+
+// FindingVulnClassOption 是发现页「漏洞类型」筛选下拉的一项:漏洞子类型名称及其漏洞条数。
+export interface FindingVulnClassOption {
+  name: string;
+  count: number;
+}
+
+// FindingVulnClassGroupOption 是归一化后的父类型（如 BOLA/IDOR）及其全部变体的合计条数。
+export interface FindingVulnClassGroupOption {
+  name: string;
+  count: number;
 }
 
 // FindingTaskOption 是发现页「按任务」筛选下拉的一项:有漏洞的任务(描述为空表示任务已删除,
@@ -604,6 +618,8 @@ export interface FindingQuery {
   severity?: "all" | Severity;
   status?: "all" | FindingStatus;
   vulnclass?: string;
+  // vulnclassGroup 是归一化后的父类型（如 BOLA/IDOR），筛选时包含该组全部原始类型。
+  vulnclassGroup?: string;
   task?: string; // 任务 id;"all"/空 = 不按任务筛选
   query?: string;
   sort?: "severity" | "time";
@@ -612,6 +628,8 @@ export interface FindingQuery {
   to?: string; // ISO timestamp, inclusive
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
   assetScope?: string;
+  // assetScopes 是多选资产节点；非空时取所有子树的并集，优先于 assetScope。
+  assetScopes?: string[];
 }
 
 // ---- Findings by asset (资产视图) ----
