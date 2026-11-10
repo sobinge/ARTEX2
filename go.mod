@@ -2,6 +2,11 @@ module github.com/Autumn-27/artex
 
 go 1.26.10
 
+// Upstream github.com/Autumn-27/norma went closed-source and is no longer
+// available from the module proxy; keep the vendored v0.4.3 source so builds
+// (including Docker) stay reproducible.
+replace github.com/Autumn-27/norma => ./norma
+
 require (
 	mvdan.cc/sh/v3 v3.10.0
 	github.com/Autumn-27/norma v0.4.3

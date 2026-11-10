@@ -216,6 +216,32 @@ func TestFindingAssetScopeFilter(t *testing.T) {
 		})
 	}
 
+	// 多选资产取并集：两棵互不相交的树同时选中时，两边的发现都要保留。
+	t.Run("多选并集", func(t *testing.T) {
+		f := base
+		f.AssetScopes = []string{assetKey(rootID), assetKey(otherID)}
+		items, total, err := d.ListFindingsPage(f, 1, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != 2 || len(items) != 2 {
+			t.Fatalf("multi select: want 2 findings, got total=%d items=%d", total, len(items))
+		}
+	})
+
+	// 多选里同时包含未关联桶时，子域名发现与两条未关联发现都要保留。
+	t.Run("多选含未关联", func(t *testing.T) {
+		f := base
+		f.AssetScopes = []string{FindingUnassignedAsset, assetKey(subID)}
+		items, total, err := d.ListFindingsPage(f, 1, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != 3 || len(items) != 3 {
+			t.Fatalf("multi select unassigned: want 3 findings, got total=%d items=%d", total, len(items))
+		}
+	})
+
 	// 不带 scope 时四条都在。
 	if _, total, err := d.ListFindingsPage(base, 1, 50); err != nil || total != 4 {
 		t.Fatalf("unscoped: want 4, got %d (%v)", total, err)
