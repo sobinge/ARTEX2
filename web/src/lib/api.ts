@@ -34,6 +34,8 @@ import type {
   DeleteTaskResult,
   Edge,
   EgressReport,
+  ProxyPoolEntry,
+  ProxySwitchLog,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
@@ -118,6 +120,24 @@ import type {
   WorkspaceListing,
   SystemMetrics,
 } from "@/lib/types";
+
+/**
+ * Read a download name from Content-Disposition. RFC 5987's filename* is
+ * preferred because it preserves UTF-8 names; older filename remains the
+ * fallback for clients that do not understand it.
+ */
+export function downloadFilename(contentDisposition: string, fallback: string): string {
+  const encoded = contentDisposition.match(/(?:^|;)\s*filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.replace(/^"|"$/g, ""));
+    } catch {
+      // Fall through to the legacy token when a malformed header is received.
+    }
+  }
+  const legacy = contentDisposition.match(/(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;\s]+))/i);
+  return (legacy?.[1] ?? legacy?.[2] ?? fallback).trim() || fallback;
+}
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -231,6 +251,13 @@ const del = <T>(p: string, body?: unknown) =>
 
 // Go serializes nil slices as JSON null — coerce to [].
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
+
+// Empty Go slices can arrive as null from older servers. Keep proxy-pool
+// consumers safe across initial load, import, and health-check refreshes.
+function normalizeProxyPool<T extends { entries: ProxyPoolEntry[]; switch_log: ProxySwitchLog[] }>(pool: T): T {
+  return { ...pool, entries: arr(pool.entries), switch_log: arr(pool.switch_log) };
+}
+
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
 
 // findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
@@ -295,8 +322,9 @@ function schedulePayload(input: ScheduleInput) {
 }
 
 export const api = {
-  // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
-  health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  // 健康检查受可选 Basic Auth 保护且不返回应用名称或版本；版本号仅向已登录管理员提供。
+  health: () => get<{ ok: boolean }>("/health"),
+  version: () => http<{ version: string }>("/version", { cache: "no-store" }),
   systemMetrics: () => get<SystemMetrics>("/system/metrics"),
 
   // ---- auth ----
@@ -322,6 +350,7 @@ export const api = {
     timeoutSeconds?: number;
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
+    shareGlobalAssets?: boolean;
     coverageEnabled?: boolean;
     workerCount?: number;
     interceptRules?: AssetInterceptRuleInput[];
@@ -339,6 +368,7 @@ export const api = {
       timeout_seconds: input.timeoutSeconds ?? 0,
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
+      share_global_assets: input.shareGlobalAssets ?? false,
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       worker_count: input.workerCount ?? 0, // 0 = 用全局默认 workers
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
@@ -356,7 +386,7 @@ export const api = {
   runScheduleNow: (id: number) =>
     post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string }) =>
+  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean }) =>
     patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
@@ -538,6 +568,7 @@ export const api = {
   },
   workspaceDownload: async (path: string) => {
     let blob: Blob;
+    let contentDisposition = "";
     if (MOCK) {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
@@ -546,12 +577,13 @@ export const api = {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
+      contentDisposition = r.headers.get("Content-Disposition") ?? "";
       blob = await r.blob();
     }
     const objUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = objUrl;
-    a.download = path.split("/").pop() || "download";
+    a.download = downloadFilename(contentDisposition, path.split("/").pop() || "download");
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -680,7 +712,8 @@ export const api = {
       { case_id: id },
     ),
   findingCaseReviewRuns: () => get<FindingCaseReviewRun[]>("/exploration/finding-case-review"),
-  findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+  findingStats: (q: Omit<FindingQuery, "page" | "pageSize"> = {}) =>
+    get<FindingStats>(`/exploration/findings/stats?${findingFilterParams(q).toString()}`),
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {
@@ -708,8 +741,7 @@ export const api = {
     const blob = await r.blob();
     // 文件名优先取后端 Content-Disposition,取不到则用默认名。
     const disp = r.headers.get("Content-Disposition") ?? "";
-    const m = disp.match(/filename="?([^"]+)"?/);
-    const filename = m?.[1] ?? `findings-export`;
+    const filename = downloadFilename(disp, `findings-export`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -973,11 +1005,42 @@ export const api = {
     web_search_proxy?: string;
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
+    deepseek_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
 
-  // global_proxy 传空 = 测直连；probe_url 可覆盖默认探测地址（隔离网用）。
-  testEgressProxy: (patch: { global_proxy?: string; probe_url?: string }) =>
+  // global_proxy 传空=测直连；probe_url 省略=已保存地址，空串=默认，非空=临时覆盖。
+  testEgressProxy: (patch: { global_proxy?: string; probe_url?: string; resume?: boolean }) =>
     post<EgressReport>(`/settings/proxy/test`, patch),
+  proxyPool: () =>
+    get<{ entries: ProxyPoolEntry[]; active_id: string; active_proxy: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool`,
+    ).then(normalizeProxyPool),
+  importProxyPool: (payload: Record<string, unknown>) =>
+    post<{
+      entries: ProxyPoolEntry[];
+      active_id: string;
+      switch_log: ProxySwitchLog[];
+      errors: Array<{ line: number; input: string; error: string }>;
+    }>(`/settings/proxy-pool/import`, payload).then((r) => ({ ...normalizeProxyPool(r), errors: arr(r.errors) })),
+  updateProxyPool: (id: string, payload: Partial<Pick<ProxyPoolEntry, "url" | "name" | "remark" | "enabled">>) =>
+    put<{ entry: ProxyPoolEntry }>(`/settings/proxy-pool/${encodeURIComponent(id)}`, payload),
+  deleteProxyPool: (id: string) => del<{ ok: boolean }>(`/settings/proxy-pool/${encodeURIComponent(id)}`),
+  testProxyPoolEntry: (id: string) =>
+    post<{ ok: boolean; result?: EgressReport["checks"][number]["result"] }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/test`,
+      {},
+    ),
+  testAllProxyPool: () =>
+    post<{ entries: ProxyPoolEntry[]; active_id: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool/test-all`,
+      {},
+    ).then(normalizeProxyPool),
+  activateProxyPool: (id: string) =>
+    post<{ ok: boolean; active_id: string; active_proxy: string }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/activate`,
+      {},
+    ),
+  testTaskProxy: (taskID: string) => post<{ ok: boolean; error?: string }>(`/tasks/${taskID}/proxy/test`, {}),
 
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，

@@ -169,7 +169,9 @@ type Traffic struct {
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream atomic.Pointer[url.URL]
+	upstream        atomic.Pointer[url.URL]
+	upstreamMu      sync.RWMutex
+	upstreamFailure func(error)
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -327,6 +329,27 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
+// SetUpstreamFailureHandler observes failures from the configured global
+// upstream proxy. The callback is intentionally best-effort and must not block
+// the MITM request path.
+func (t *Traffic) SetUpstreamFailureHandler(fn func(error)) {
+	t.upstreamMu.Lock()
+	t.upstreamFailure = fn
+	t.upstreamMu.Unlock()
+}
+
+func (t *Traffic) reportUpstreamFailure(err error) {
+	if err == nil || t.upstream.Load() == nil {
+		return
+	}
+	t.upstreamMu.RLock()
+	fn := t.upstreamFailure
+	t.upstreamMu.RUnlock()
+	if fn != nil {
+		go fn(err)
+	}
+}
+
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
 // user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
@@ -400,7 +423,14 @@ func (s *sink) Response(f *mproxy.Flow) {
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
 // errors) — not a plain target-unreachable error — we flag the host for
 // transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
+func (s *sink) RequestError(f *mproxy.Flow, err error) {
+	s.t.reportUpstreamFailure(err)
+	s.t.maybePassthrough(f, err)
+}
+
+func (s *sink) HTTPConnectError(_ *mproxy.Flow, err error) {
+	s.t.reportUpstreamFailure(err)
+}
 
 // maybePassthrough marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
@@ -932,13 +962,13 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
-		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
+		const meta = "id LIKE ? OR host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
 		// Metadata match OR full-text match: one search box, widest recall. Terms
 		// too short for trigram silently fall back to metadata only.
 		if cond, arg, ok := t.ftsFilter(s); ok {
-			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, arg)
+			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, like, arg)
 		} else {
-			add("("+meta+")", like, like, like, like, like, like)
+			add("("+meta+")", like, like, like, like, like, like, like)
 		}
 	}
 	// Body is the dedicated content box: it only searches captured request/response
@@ -2118,10 +2148,10 @@ func (t *Traffic) Tools() []actool.CoreTool {
 
 	get := actool.Build(actool.Spec{
 		Name:        "traffic_get",
-		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。配合 traffic_search 用，避免重复 curl。",
+		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。id 与流量页面展示的流量 ID、traffic_search 返回的 id 相同，须完整保留，不是列表行号。已知 ID 时直接读取，无需重新搜索或请求目标。",
 		Schema: map[string]any{
 			"type":       "object",
-			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "traffic_search 返回的 id"}},
+			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "流量页面或 traffic_search 返回的完整流量 ID（不是列表行号）"}},
 			"required":   []any{"id"},
 		},
 		ReadOnly:    ro,
