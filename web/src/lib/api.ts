@@ -334,6 +334,11 @@ export const api = {
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
+  // ---- account preferences (cross-device UI memory) ----
+  userPreferences: () => get<{ preferences: Record<string, unknown>; updated_at?: string }>("/me/preferences"),
+  updateUserPreferences: (preferences: Record<string, unknown>) =>
+    patch<{ ok: boolean; updated_at: string }>("/me/preferences", { preferences }),
+
   // ---- tasks ----
   tasks: () =>
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
@@ -386,8 +391,10 @@ export const api = {
   runScheduleNow: (id: number) =>
     post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean }) =>
-    patch<Task>(`/tasks/${id}`, input),
+  updateTask: (
+    id: string,
+    input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean },
+  ) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
@@ -403,11 +410,19 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">,
+    input: Pick<
+      TaskTemplate,
+      "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+    >,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">>,
+    input: Partial<
+      Pick<
+        TaskTemplate,
+        "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+      >
+    >,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>

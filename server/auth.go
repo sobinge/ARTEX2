@@ -92,15 +92,35 @@ func signJWT(key []byte) (string, error) {
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+// parseJWT validates signature and expiry and returns the parsed token.
+func parseJWT(tokenStr string, key []byte) (*jwt.Token, error) {
+	return jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return key, nil
 	})
+}
+
+// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
+func verifyJWT(tokenStr string, key []byte) bool {
+	t, err := parseJWT(tokenStr, key)
 	return err == nil && t.Valid
+}
+
+// jwtSubject returns the authenticated account key carried by the token.
+// requireAuth has already validated the token before handlers call this, but it
+// still validates here so handlers cannot accidentally trust an unsigned value.
+func jwtSubject(tokenStr string, key []byte) string {
+	t, err := parseJWT(tokenStr, key)
+	if err != nil || !t.Valid {
+		return ""
+	}
+	sub, err := t.Claims.GetSubject()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(sub)
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,

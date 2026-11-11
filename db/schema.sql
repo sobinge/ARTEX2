@@ -359,6 +359,16 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Per-account UI preferences (findings pagination/filters, etc.). The key is the
+-- authenticated JWT subject so preferences stay scoped when more accounts are
+-- added; today the login user is ARTEX. Values are namespaced JSON objects and
+-- PATCH merges only top-level keys, letting each page own its namespace.
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_key    TEXT PRIMARY KEY,
+    preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,

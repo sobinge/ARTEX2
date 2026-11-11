@@ -136,6 +136,79 @@ const EMPTY_STATS: FindingStats = {
   tasks: [],
 };
 
+const FLAT_PAGE_SIZE_OPTIONS = [10, 20, 50, 100] as const;
+const GROUP_PAGE_SIZE_OPTIONS = [5, 10, 20] as const;
+
+// FindingListPreferences is the account-scoped UI memory for this page. Keep the
+// fields optional so older localStorage payloads and fresh accounts both work.
+interface FindingListPreferences {
+  view?: FindingView;
+  severity?: "all" | Severity;
+  status?: "all" | FindingStatus;
+  vulnclass?: string;
+  task?: string;
+  sort?: "severity" | "time";
+  query?: string;
+  from?: string;
+  to?: string;
+  flatPageSize?: number;
+  flatPage?: number;
+  groupPageSize?: number;
+  groupPage?: number;
+  casePageSize?: number;
+  casePage?: number;
+  assetScopes?: string[];
+}
+
+function isPositiveInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function isAllowedPageSize(value: unknown, options: readonly number[]): value is number {
+  return typeof value === "number" && options.includes(value);
+}
+
+function parseFindingListPreferences(raw: unknown): FindingListPreferences | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const source = raw as Record<string, unknown>;
+  const out: FindingListPreferences = {};
+  if (FINDING_VIEWS.includes(source.view as FindingView)) out.view = source.view as FindingView;
+  if (source.severity === "all" || SEVERITIES.includes(source.severity as Severity)) {
+    out.severity = source.severity as "all" | Severity;
+  }
+  if (source.status === "all" || FINDING_STATUSES.includes(source.status as FindingStatus)) {
+    out.status = source.status as "all" | FindingStatus;
+  }
+  if (typeof source.vulnclass === "string" && source.vulnclass) out.vulnclass = source.vulnclass;
+  if (typeof source.task === "string" && source.task) out.task = source.task;
+  if (source.sort === "severity" || source.sort === "time") out.sort = source.sort;
+  if (typeof source.query === "string") out.query = source.query;
+  if (typeof source.from === "string" && source.from) out.from = source.from;
+  if (typeof source.to === "string" && source.to) out.to = source.to;
+  if (isAllowedPageSize(source.flatPageSize, FLAT_PAGE_SIZE_OPTIONS)) out.flatPageSize = source.flatPageSize;
+  if (isPositiveInt(source.flatPage)) out.flatPage = source.flatPage;
+  if (isAllowedPageSize(source.groupPageSize, GROUP_PAGE_SIZE_OPTIONS)) out.groupPageSize = source.groupPageSize;
+  if (isPositiveInt(source.groupPage)) out.groupPage = source.groupPage;
+  if (isAllowedPageSize(source.casePageSize, FLAT_PAGE_SIZE_OPTIONS)) out.casePageSize = source.casePageSize;
+  if (isPositiveInt(source.casePage)) out.casePage = source.casePage;
+  if (Array.isArray(source.assetScopes)) {
+    out.assetScopes = [
+      ...new Set(source.assetScopes.filter((value): value is string => typeof value === "string" && !!value)),
+    ].slice(0, 50);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function readCachedFindingPreferences(): FindingListPreferences | null {
+  const raw = getLocalStorageValue(FINDING_LIST_PREFERENCE_KEY);
+  if (!raw) return null;
+  try {
+    return parseFindingListPreferences(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
 export default function FindingsPage() {
   const [view, setView] = React.useState<FindingView>("cases");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
@@ -150,6 +223,8 @@ export default function FindingsPage() {
   const [flat, setFlat] = React.useState<FlatFindingsState>(EMPTY_FLAT_STATE);
   const [flatPage, setFlatPage] = React.useState(1);
   const [flatPageSize, setFlatPageSize] = React.useState(20);
+  const [casePage, setCasePage] = React.useState(1);
+  const [casePageSize, setCasePageSize] = React.useState(20);
   const [assetTree, setAssetTree] = React.useState<AssetTreeState>(EMPTY_ASSET_TREE);
   const [assetScopes, setAssetScopes] = React.useState<string[]>([]);
   const toggleAssetScope = React.useCallback((key: string) => {
@@ -213,42 +288,128 @@ export default function FindingsPage() {
     };
   }, []);
 
-  React.useEffect(() => {
-    const raw = getLocalStorageValue(FINDING_LIST_PREFERENCE_KEY);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw) as {
-          view?: unknown;
-          severity?: unknown;
-          status?: unknown;
-          vulnclass?: unknown;
-          task?: unknown;
-          sort?: unknown;
-        };
-        if (FINDING_VIEWS.includes(parsed.view as FindingView)) setView(parsed.view as FindingView);
-        if (parsed.severity === "all" || SEVERITIES.includes(parsed.severity as Severity)) {
-          setSeverity(parsed.severity as "all" | Severity);
-        }
-        if (parsed.status === "all" || FINDING_STATUSES.includes(parsed.status as FindingStatus)) {
-          setStatus(parsed.status as "all" | FindingStatus);
-        }
-        if (typeof parsed.vulnclass === "string" && parsed.vulnclass) setVulnclass(parsed.vulnclass);
-        if (typeof parsed.task === "string" && parsed.task) setTask(parsed.task);
-        if (parsed.sort === "severity" || parsed.sort === "time") setSort(parsed.sort);
-      } catch {
-        // Ignore malformed or legacy preferences and retain the defaults.
-      }
+  const applyFindingPreferences = React.useCallback((preferences: FindingListPreferences) => {
+    if (preferences.view) setView(preferences.view);
+    if (preferences.severity) setSeverity(preferences.severity);
+    if (preferences.status) setStatus(preferences.status);
+    if (preferences.vulnclass) setVulnclass(preferences.vulnclass);
+    if (preferences.task) setTask(preferences.task);
+    if (preferences.sort) setSort(preferences.sort);
+    if (typeof preferences.query === "string") {
+      setSearch(preferences.query);
+      setQuery(preferences.query);
     }
-    setPreferencesHydrated(true);
+    if (preferences.from || preferences.to) {
+      setDateRange({ from: preferences.from, to: preferences.to });
+    }
+    if (preferences.flatPageSize) setFlatPageSize(preferences.flatPageSize);
+    if (preferences.flatPage) setFlatPage(preferences.flatPage);
+    if (preferences.groupPageSize) setPageSize(preferences.groupPageSize);
+    if (preferences.groupPage) setPage(preferences.groupPage);
+    if (preferences.casePageSize) setCasePageSize(preferences.casePageSize);
+    if (preferences.casePage) setCasePage(preferences.casePage);
+    if (preferences.assetScopes) setAssetScopes(preferences.assetScopes);
   }, []);
 
+  // Hydrate from the authenticated account first, then fall back to the old
+  // browser-local cache. A cache carried by an older build is migrated once.
+  React.useEffect(() => {
+    let active = true;
+    async function hydrate() {
+      const cached = readCachedFindingPreferences();
+      let serverPreferences: FindingListPreferences | null = null;
+      let serverHasPreferences = false;
+      try {
+        const result = await api.userPreferences();
+        const parsed = parseFindingListPreferences(result.preferences?.findings);
+        if (parsed) {
+          serverPreferences = parsed;
+          serverHasPreferences = true;
+        }
+      } catch {
+        // Offline or an older backend: the local cache still keeps the UI usable.
+      }
+      const preferences = serverPreferences ?? cached;
+      if (!active) return;
+      if (preferences) {
+        applyFindingPreferences(preferences);
+        setLocalStorageValue(FINDING_LIST_PREFERENCE_KEY, JSON.stringify(preferences));
+      }
+      setPreferencesHydrated(true);
+      if (!serverHasPreferences && cached) {
+        void api.updateUserPreferences({ findings: cached }).catch(() => undefined);
+      }
+    }
+    void hydrate();
+    return () => {
+      active = false;
+    };
+  }, [applyFindingPreferences]);
+
+  const preferencesSaveReady = React.useRef(false);
+  const latestPreferences = React.useRef<FindingListPreferences | null>(null);
   React.useEffect(() => {
     if (!preferencesHydrated) return;
-    setLocalStorageValue(
-      FINDING_LIST_PREFERENCE_KEY,
-      JSON.stringify({ view, severity, status, vulnclass, task, sort }),
-    );
-  }, [preferencesHydrated, severity, sort, status, task, view, vulnclass]);
+    if (!preferencesSaveReady.current) {
+      preferencesSaveReady.current = true;
+      return;
+    }
+    const snapshot: FindingListPreferences = {
+      view,
+      severity,
+      status,
+      vulnclass,
+      task,
+      sort,
+      query,
+      from: dateRange.from,
+      to: dateRange.to,
+      flatPageSize,
+      flatPage,
+      groupPageSize: pageSize,
+      groupPage: page,
+      casePageSize,
+      casePage,
+      assetScopes,
+    };
+    latestPreferences.current = snapshot;
+    const encoded = JSON.stringify(snapshot);
+    // Keep the synchronous cache so a full page reload still has an instant
+    // fallback if the preference request is temporarily unavailable.
+    setLocalStorageValue(FINDING_LIST_PREFERENCE_KEY, encoded);
+    const timer = window.setTimeout(() => {
+      void api.updateUserPreferences({ findings: snapshot }).catch(() => undefined);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [
+    preferencesHydrated,
+    view,
+    severity,
+    status,
+    vulnclass,
+    task,
+    sort,
+    query,
+    dateRange.from,
+    dateRange.to,
+    flatPageSize,
+    flatPage,
+    pageSize,
+    page,
+    casePageSize,
+    casePage,
+    assetScopes,
+  ]);
+
+  // A detail link can be clicked within the save debounce window. Flush the last
+  // snapshot on unmount so the next page load still sees the chosen page size.
+  React.useEffect(
+    () => () => {
+      const snapshot = latestPreferences.current;
+      if (snapshot) void api.updateUserPreferences({ findings: snapshot }).catch(() => undefined);
+    },
+    [],
+  );
 
   React.useEffect(() => {
     const timer = window.setTimeout(() => setQuery(search.trim()), 300);
@@ -414,7 +575,15 @@ export default function FindingsPage() {
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclassGroup: vulnclass, task, query, sort, ...dateRange });
+      const result = await api.findingAssetTree({
+        severity,
+        status,
+        vulnclassGroup: vulnclass,
+        task,
+        query,
+        sort,
+        ...dateRange,
+      });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -573,9 +742,18 @@ export default function FindingsPage() {
   );
 
   // Reset every view's pagination and expansion when a shared finding filter changes.
+  // The first hydrated render is the saved state itself; only reset after a real
+  // user change, otherwise restoring a remembered page would immediately undo it.
+  const filterResetReady = React.useRef(false);
   React.useEffect(() => {
+    if (!preferencesHydrated) return;
+    if (!filterResetReady.current) {
+      filterResetReady.current = true;
+      return;
+    }
     void filterFingerprint;
     setPage(1);
+    setCasePage(1);
     setExpanded(null);
     setExpandedGroups(new Set());
     setGroupFindings({});
@@ -584,13 +762,19 @@ export default function FindingsPage() {
     // 筛选变了树也会变,原先选中的节点可能已经不在树里,退回「全部资产」。
     setAssetScopes([]);
     setAssetTree(EMPTY_ASSET_TREE);
-  }, [filterFingerprint]);
+  }, [filterFingerprint, preferencesHydrated]);
 
-  // 换资产节点等于换了一份结果集,回到第一页。
+  // 换资产节点等于换了一份结果集,回到第一页。首次水合仍是恢复保存的页码。
+  const assetScopeResetReady = React.useRef(false);
   React.useEffect(() => {
+    if (!preferencesHydrated) return;
+    if (!assetScopeResetReady.current) {
+      assetScopeResetReady.current = true;
+      return;
+    }
     void assetScopes;
     setFlatPage(1);
-  }, [assetScopes]);
+  }, [assetScopes, preferencesHydrated]);
 
   // 资产树只在进入视图 / 筛选变化时查一次(以及本页改动发现后由
   // refreshAfterMutation 主动重拉),不做轮询。
@@ -831,12 +1015,48 @@ export default function FindingsPage() {
   // 「独立漏洞」是另一个口径（同一漏洞案例合并去重），用 hint 明确标注，避免被误读成
   // 「列表应该只有这么多条」。此前级别卡优先取 distinct(去重) 值，与列表条数打架。
   const statCards = [
-    { label: "独立漏洞", value: stats.distinct?.total ?? stats.total, icon: BugIcon, tone: "", hint: "按同一漏洞案例合并去重后的数量（与列表条数口径不同）" },
-    { label: "上报记录", value: stats.total, tone: "text-amber-500", icon: ClockIcon, hint: "全部上报记录条数，与列表总条数一致" },
-    { label: "严重", value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon, hint: "严重级上报记录条数，与按严重筛选的列表条数一致" },
-    { label: "高危", value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon, hint: "高危级上报记录条数，与按高危筛选的列表条数一致" },
-    { label: "中危", value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon, hint: "中危级上报记录条数，与按中危筛选的列表条数一致" },
-    { label: "低危", value: stats.low, tone: "text-slate-500", icon: InfoIcon, hint: "低危级上报记录条数，与按低危筛选的列表条数一致" },
+    {
+      label: "独立漏洞",
+      value: stats.distinct?.total ?? stats.total,
+      icon: BugIcon,
+      tone: "",
+      hint: "按同一漏洞案例合并去重后的数量（与列表条数口径不同）",
+    },
+    {
+      label: "上报记录",
+      value: stats.total,
+      tone: "text-amber-500",
+      icon: ClockIcon,
+      hint: "全部上报记录条数，与列表总条数一致",
+    },
+    {
+      label: "严重",
+      value: stats.critical,
+      tone: "text-rose-600",
+      icon: ShieldAlertIcon,
+      hint: "严重级上报记录条数，与按严重筛选的列表条数一致",
+    },
+    {
+      label: "高危",
+      value: stats.high,
+      tone: "text-red-500",
+      icon: TriangleAlertIcon,
+      hint: "高危级上报记录条数，与按高危筛选的列表条数一致",
+    },
+    {
+      label: "中危",
+      value: stats.medium,
+      tone: "text-amber-500",
+      icon: TriangleAlertIcon,
+      hint: "中危级上报记录条数，与按中危筛选的列表条数一致",
+    },
+    {
+      label: "低危",
+      value: stats.low,
+      tone: "text-slate-500",
+      icon: InfoIcon,
+      hint: "低危级上报记录条数，与按低危筛选的列表条数一致",
+    },
   ];
 
   // 导出弹窗里「当前筛选」的条数:两个视图的筛选一致,只是统计口径来源不同。
@@ -1136,8 +1356,12 @@ export default function FindingsPage() {
           </div>
         )}
 
-        {view === "cases" && (
+        {view === "cases" && preferencesHydrated && (
           <FindingCaseList
+            page={casePage}
+            pageSize={casePageSize}
+            onPageChange={setCasePage}
+            onPageSizeChange={setCasePageSize}
             onTotal={setCaseTotal}
             query={{ severity, status, vulnclassGroup: vulnclass, task, query, sort, ...dateRange }}
             selectedIds={selectedIds}

@@ -193,10 +193,10 @@ export function FindingCaseMembers({
 
 function FindingMergeSuggestionCard({
   suggestion: s,
-  onResolve,
+  onReject,
 }: {
   suggestion: FindingCaseSuggestion;
-  onResolve: (s: FindingCaseSuggestion, accept: boolean, excludeIds?: string[]) => Promise<void>;
+  onReject: (s: FindingCaseSuggestion) => Promise<void>;
 }) {
   const [expanded, setExpanded] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -204,21 +204,11 @@ function FindingMergeSuggestionCard({
     () => (Array.isArray(s.finding_ids) && s.finding_ids.length > 0 ? s.finding_ids : [s.left_id, s.right_id]),
     [s.finding_ids, s.left_id, s.right_id],
   );
-  const [excluded, setExcluded] = React.useState<string[]>([]);
-  React.useEffect(() => {
-    setExcluded((current) => {
-      const next = current.filter((id) => ids.includes(id));
-      return next.length === current.length ? current : next;
-    });
-  }, [ids]);
-  const validExcluded = excluded.filter((id) => ids.includes(id));
-  const included = ids.filter((id) => !validExcluded.includes(id));
-  async function resolve(accept: boolean) {
+  async function reject() {
     if (busy) return;
-    if (accept && included.length < 2) return;
     setBusy(true);
     try {
-      await onResolve(s, accept, accept ? validExcluded : []);
+      await onReject(s);
     } finally {
       setBusy(false);
     }
@@ -233,23 +223,9 @@ function FindingMergeSuggestionCard({
         <CardTitle className="break-words">{s.title}</CardTitle>
         <CardDescription className="flex flex-col gap-1">
           {ids.map((id) => (
-            <span key={id} className="flex items-center gap-2">
-              <Checkbox
-                checked={!excluded.includes(id)}
-                disabled={busy}
-                onCheckedChange={(value) =>
-                  setExcluded((current) =>
-                    value === true
-                      ? current.filter((item) => item !== id)
-                      : [...current.filter((item) => item !== id), id],
-                  )
-                }
-                aria-label={`归并时包含上报 #${id}`}
-              />
-              <Link className="underline underline-offset-4" href={`/function/findings/detail/?id=${id}`}>
-                查看原报告 #{id}
-              </Link>
-            </span>
+            <Link key={id} className="underline underline-offset-4" href={`/function/findings/detail/?id=${id}`}>
+              查看原报告 #{id}
+            </Link>
           ))}
         </CardDescription>
       </CardHeader>
@@ -269,11 +245,8 @@ function FindingMergeSuggestionCard({
         </Collapsible>
       </CardContent>
       <CardFooter className="flex flex-wrap gap-2">
-        <Button variant="outline" size="sm" disabled={busy || included.length < 2} onClick={() => resolve(true)}>
+        <Button variant="ghost" size="sm" disabled={busy} onClick={reject}>
           {busy ? <Spinner /> : null}
-          {included.length === ids.length ? "整组确认归并" : `确认归并所选（${included.length} 条）`}
-        </Button>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={() => resolve(false)}>
           整组不是同一漏洞
         </Button>
       </CardFooter>
@@ -344,20 +317,16 @@ export function FindingCaseReviewPanel({ taskId, onChange }: { taskId?: string; 
       clearTimeout(timer);
     };
   }, [reload, taskId, taskKey]);
-  async function resolve(s: FindingCaseSuggestion, accept: boolean, excludeIds?: string[]) {
+  async function reject(s: FindingCaseSuggestion) {
     const seq = ++requestSeq.current;
     const requestedTask = taskKey;
     try {
-      const result = await api.resolveFindingCaseSuggestion(s.id, accept, excludeIds);
+      await api.resolveFindingCaseSuggestion(s.id, false);
       if (requestedTask === taskKeyRef.current) {
         setReload((v) => v + 1);
         if (seq === requestSeq.current) {
           setSuggestions((v) => v.filter((x) => x.id !== s.id));
-          if (accept && result.case_id !== "0") {
-            toast.success("已归并，请进入文件夹生成统一报告");
-          } else {
-            toast.success("已否决，不会自动再次归并");
-          }
+          toast.success("已否决，不会自动再次归并");
           onChange?.();
         }
       }
@@ -379,7 +348,7 @@ export function FindingCaseReviewPanel({ taskId, onChange }: { taskId?: string; 
         <p className="text-muted-foreground text-sm">待确认归并建议（{suggestions.length}）· 确认前原始记录分别保留</p>
       ) : null}
       {suggestions.map((s) => (
-        <FindingMergeSuggestionCard key={s.id} suggestion={s} onResolve={resolve} />
+        <FindingMergeSuggestionCard key={s.id} suggestion={s} onReject={reject} />
       ))}
       {runs.some((r) => r.state === "queued" || r.state === "running") ? (
         <div className="flex flex-col gap-2">
@@ -401,6 +370,10 @@ export function FindingCaseList({
   contextTask,
   readOnly = false,
   onTotal,
+  page: controlledPage,
+  pageSize: controlledPageSize,
+  onPageChange,
+  onPageSizeChange,
 }: {
   query: Omit<FindingQuery, "page" | "pageSize">;
   selectedIds?: Set<string>;
@@ -408,16 +381,26 @@ export function FindingCaseList({
   contextTask?: string;
   readOnly?: boolean;
   onTotal?: (total: number) => void;
+  page?: number;
+  pageSize?: number;
+  onPageChange?: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
 }) {
-  const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(20);
+  const [internalPage, setInternalPage] = React.useState(1);
+  const [internalPageSize, setInternalPageSize] = React.useState(20);
+  const page = controlledPage ?? internalPage;
+  const pageSize = controlledPageSize ?? internalPageSize;
   const [data, setData] = React.useState<FindingCasePage | null>(null);
   const [error, setError] = React.useState("");
   const [refresh, setRefresh] = React.useState(0);
   const key = JSON.stringify(query);
+  const lastKey = React.useRef(key);
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset pagination when the filter fingerprint changes.
   React.useEffect(() => {
-    setPage(1);
+    if (lastKey.current === key) return;
+    lastKey.current = key;
+    if (controlledPage === undefined) setInternalPage(1);
+    onPageChange?.(1);
   }, [key]);
   // biome-ignore lint/correctness/useExhaustiveDependencies: refresh is an explicit reload requested after grouping/retry.
   React.useEffect(() => {
@@ -447,12 +430,6 @@ export function FindingCaseList({
   }, [data, onTotal]);
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      {!readOnly ? (
-        <FindingCaseReviewPanel
-          taskId={query.task === "all" ? undefined : query.task}
-          onChange={() => setRefresh((v) => v + 1)}
-        />
-      ) : null}
       {error ? (
         <Alert>
           <AlertDescription>
@@ -507,10 +484,15 @@ export function FindingCaseList({
           page={page}
           pageSize={pageSize}
           total={data.total}
-          onPageChange={setPage}
+          onPageChange={(next) => {
+            if (controlledPage === undefined) setInternalPage(next);
+            onPageChange?.(next);
+          }}
           onPageSizeChange={(size) => {
-            setPageSize(size);
-            setPage(1);
+            if (controlledPageSize === undefined) setInternalPageSize(size);
+            onPageSizeChange?.(size);
+            if (controlledPage === undefined) setInternalPage(1);
+            onPageChange?.(1);
           }}
           pageSizeOptions={[10, 20, 50, 100]}
         />

@@ -805,6 +805,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings/basic-auth", s.getBasicAuthSettings)
 	mux.HandleFunc("PUT /api/settings/basic-auth", s.saveBasicAuthSettings)
 
+	// 账号级 UI 偏好（发现页分页/筛选等）。requireAuth 已校验 JWT，handler 再从
+	// subject 取账号键，偏好不会跨账号串读。
+	mux.HandleFunc("GET /api/me/preferences", s.getMyPreferences)
+	mux.HandleFunc("PATCH /api/me/preferences", s.patchMyPreferences)
+
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/version", s.version)
 	mux.HandleFunc("GET /api/stats", s.stats)
